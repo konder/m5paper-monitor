@@ -249,7 +249,9 @@ static bool connectMqtt() {
 // 曾经和框架的同名声明撞车,宏不认 namespace)。
 static espble::LinkConfig bleConfig() {
     espble::LinkConfig cfg;
-    cfg.deviceName = BLE_NAME;
+    cfg.deviceType = BLE_TYPE;      // 广播名 = m5paper-<efuse MAC 后3字节>
+    cfg.fwVersion  = FW_VERSION;
+    cfg.caps       = BLE_CAPS;
     return cfg;
 }
 

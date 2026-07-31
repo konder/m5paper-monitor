@@ -3,7 +3,7 @@
 // v26 起:WiFi + MQTT 常连 + PM 自动轻睡眠(WiFi modem sleep),低功耗且通知即时;全屋覆盖不受 BLE 距离限制。
 
 // 固件版本(每次要 OTA 推新时 +1;gateway 的 /fw/version 返回值 > 此值即触发更新)
-#define FW_VERSION 40
+#define FW_VERSION 41
 
 // ---- MQTT 主题 ----
 #define TOPIC_EVENT  "m5paper/events"  // 事件:done/needs_input/quota(QoS1 离线排队)
@@ -18,8 +18,12 @@
 #define USAGE_REPAINT_MIN_MS 120000
 
 // ---- 双模(v30):BLE 优先(低功耗即时)+ WiFi 兜底;射频互斥 ----
-#define BLE_NAME     "M5PaperNotify"   // BLE 广播名(中枢按此精确匹配)
-// v40 起:GATT UUID、帧上限、连接参数纪律全部归 esp-ble-link,本工程不再复述。
+// v41:身份改由框架派生 —— 广播名自动是 `<BLE_TYPE>-<efuse MAC 后3字节>`,
+// 例如 m5paper-c119cc。同一份固件烧多块板子自动不重名,BleHub 按 `m5paper-` 前缀发现。
+// (v40 之前是写死的 "M5PaperNotify",那意味着每台设备一份固件。)
+#define BLE_TYPE     "m5paper"
+#define BLE_CAPS     "usage,ev,cmd"    // 随 hello 帧上报,中枢据此决定广播发不发给它
+// GATT UUID、帧上限、连接参数纪律全部归 esp-ble-link,本工程不再复述。
 // 需要非默认值时在 main.cpp 的 bleConfig() 里覆盖 LinkConfig 对应字段。
 // 双模切换时序(这部分是本工程自己的策略,框架不管)
 #define BLE_BOOT_WAIT_MS     30000     // 开机等中枢连上的时长,超时→WiFi 兜底

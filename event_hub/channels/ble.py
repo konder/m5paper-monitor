@@ -67,7 +67,8 @@ class BleChannel:
         device = DeviceConfig(
             app_path=os.path.expanduser(c.get("helper_app") or DEFAULT_APP),
             session_dir=os.path.expanduser(c.get("session_dir") or DEFAULT_SESSION_DIR),
-            device_name=c.get("device_name") or "M5PaperNotify",
+            device_name=c.get("device_name") or "",
+            name_prefix=c.get("name_prefix") or "m5paper-",  # v41:身份由固件从 efuse MAC 派生
             scan_timeout=float(c.get("scan_timeout", 20.0)),
         )
         # autostart=False:等 RetainedChannel 把 on_connect / keepalive 接上再启动,

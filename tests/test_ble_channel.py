@@ -71,10 +71,10 @@ def test_link_is_started_after_callbacks_are_wired(ch):
     assert ch._link.started
 
 
-def test_device_matched_by_exact_name(ch):
-    # 桌上还有 Codex-*/Claude-* 两个 NUS 设备,只能按精确名匹配
-    assert ch._link.device.device_name == "M5PaperNotify"
-    assert ch._link.device.name_prefix is None
+def test_device_matched_by_type_prefix(ch):
+    # v41:身份由固件从 efuse MAC 派生,广播名 m5paper-<id>,所以按类型前缀匹配。
+    # 桌上还有 Codex-*/Claude-* 两个 NUS 设备,前缀足以把它们排除掉。
+    assert ch._link.device.name_prefix == "m5paper-"
 
 
 def test_no_protocol_details_are_restated_here(ch):
