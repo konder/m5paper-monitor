@@ -1,0 +1,74 @@
+# M5PaperS3 监控 collector 配置
+
+[mqtt]
+# broker 地址。broker 与 collector 同机时填 127.0.0.1。
+host = "127.0.0.1"
+port = 1883
+username = ""            # 留空 = 匿名
+password = ""
+state_topic = "m5paper/state"    # retained 全量快照(历史遗留,设备当前不订阅)
+event_topic = "m5paper/events"   # 瞬时事件(完成/需输入/额度告警)
+usage_topic = "m5paper/usage"    # retained 消耗看板(四行油量表)
+
+[collector]
+refresh_sec = 20         # 快照刷新间隔(秒)
+with_quota = true        # 是否拉取额度(claude 走本地日志估算)
+
+[thumb]
+port = 8899              # 灰度缩略图 HTTP 服务端口 + OTA /fw(8080 被占)
+
+[event]
+port = 8898             # hook 事件接收端口(仅本机)
+quota_alert_pct = 85   # 已用达此百分比即发额度告警(看板每行通用,含网关流量配额)
+
+# ⚠️ 以下各节必须是扁平 key = value。Mac Mini 是 py3.9 没有 tomllib,
+# 走 collector.py 的 _tiny_toml 回退,不支持数组和嵌套表。
+
+[litellm]
+# DGX 上的 litellm proxy。⚠️ 10.10.10.5(万兆直连)当前不通,走家里网段。
+# base_url 或 api_key 留空 = 关掉该源,看板 LiteLLM 那行显示「旧」。
+# 只有 token / 请求数,没有金额 —— 该 proxy 的自建模型没配单价,spend 恒为 0。
+base_url = "http://192.168.101.128:4000"
+api_key = ""             # general_settings.master_key
+ttl_sec = 60
+
+[gwtraffic]
+# 代理网关 VPS 的 /run/gwtraffic.json。⚠️ ControlMaster socket 是 0600 owned by
+# 当前用户 → 本采集必须以该用户跑(LaunchAgent 可以,root 的 LaunchDaemon 不行)。
+host = ""                # 如 "root@1.2.3.4";留空 = 关掉该源
+control_path = "~/.ssh/cm-gwtraffic.sock"
+identity = "~/.ssh/id_ed25519"
+ttl_sec = 30
+
+[usage]
+enabled = true
+min_republish_sec = 300  # 无实质变化时的心跳重发间隔;rev 不变,设备不重绘
+tz_offset_hours = 8      # 顶栏时钟的时区偏移。Mac Mini 系统时区是 US/Pacific,
+                         # 直接用 localtime 会在墨水屏上显示美西时间(时钟本身是准的)
+
+[channels]
+# 设备固件是双模的(BLE 优先 + WiFi/MQTT 兜底),所以两条渠道可以同时开:
+#   ble  = true  → 经原生 Swift helper 直连设备,**完全不需要 mosquitto**
+#   mqtt = true  → 经 broker,设备落 WiFi 兜底时仍能收
+# 只想要 BLE、彻底去掉 broker:把 mqtt 设成 false。
+# ⚠️ 开 ble 前先装 espble 并编 helper(v40 起链路层来自 esp-ble-link):
+#      pip install -e ~/esp-ble-link/host
+#      espble build-helper --name M5PaperBLEHelper \
+#                          --bundle-id com.nanzhang.m5paper.blehelper
+#    首次运行需在 系统设置 > 隐私与安全性 > 蓝牙 里允许它,而且监护进程必须在
+#    GUI 会话里(SSH 里 open 出来的 helper 拿不到 bluetoothd,现象是事件流卡在
+#    central_created —— 那不是签名问题,详见 esp-ble-link 的 docs/pitfalls.md B1)。
+mqtt = true
+ble = false
+
+[ble]
+device_name = "M5PaperNotify"   # 精确名匹配。桌上还有 Codex-*/Claude-* 两个 NUS 设备,
+                                # 只按 service UUID 兜底会抢到别人的 stick
+helper_app = ""                 # 留空 = <repo>/.build/native/M5PaperBLEHelper.app
+session_dir = ""                # 留空 = ~/.config/m5paper-monitor/ble-session
+reconnect_sec = 5               # 前几次的重试间隔(掉线就丢掉整个 helper 进程重开)
+backoff_max_sec = 45            # 连续失败 5 次后放缓到这个间隔;别调太大,设备在
+                                # WiFi 兜底时每 5 分钟只回试 15s,退避过长会一直错过
+keepalive_sec = 30              # 重发 retained 的 usage 探活(rev 不变→设备不重绘墨水屏)
+history_n = 8                   # 重连后以 live:false 补发的最近事件条数
+scan_timeout = 20               # helper 扫不到设备多久自杀,交给 Python 重开

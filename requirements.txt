@@ -1,0 +1,10 @@
+# collector 本体只用标准库;这两个是可选渠道/工具的依赖。
+#
+# BLE 渠道(v40 起链路层来自通用框架 esp-ble-link):
+#   框架尚未开源,先装本地路径 ——
+#     pip install -e ~/esp-ble-link/host
+#   push 到 GitHub 之后换成:
+#     espble @ git+https://github.com/konder/esp-ble-link.git#subdirectory=host
+#
+# MQTT 渠道:
+paho-mqtt

@@ -1,0 +1,18 @@
+# ---- 凭据:模板进仓库,真值永不进 ----
+firmware/include/secrets.h
+config/config.toml
+config/config.toml.bak-*
+
+# ---- 构建产物 ----
+firmware/.pio/
+.build/
+fw/                 # espble ota publish 的落点(current.bin + version.txt)
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+
+.DS_Store
