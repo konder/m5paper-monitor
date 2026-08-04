@@ -7,6 +7,7 @@ config/config.toml.bak-*
 firmware/.pio/
 .build/
 fw/                 # espble ota publish 的落点(current.bin + version.txt)
+shots/              # 设备回传的屏幕截图(cmd=dump → thumbserver POST /screen)
 
 # ---- Python ----
 __pycache__/

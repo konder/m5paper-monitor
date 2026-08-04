@@ -86,3 +86,38 @@ void checkOTA() {
     }
     // 成功会自动重启;NO_UPDATES/其它情况直接返回继续正常启动
 }
+
+// 调试:把当前屏幕内容原样回传给网关(落成 PNG,供 AI agent 直接查看渲染结果)。
+//
+// 读的是 lgfx::Panel_EPD 在 PSRAM 里的整屏像素缓冲(它继承 Panel_HasBuffer 并 override 了
+// readRect),**不碰面板硬件** —— 所以 EPD 已经 sleep() 断电时照样能 dump,而且不会触发重绘。
+// 尺寸走 d.width()/d.height() 运行时取:setRotation(1) 叠面板自带的 offset_rotation=3
+// 之后逻辑尺寸才是 960x540,写死容易错。
+// readRect 的 void* 重载是 bgr888;灰度源三通道相等,所以网关随便取一个通道就是精确的
+// 8bit 灰度,设备侧一个位运算都不用做。(uint8_t* 重载是 rgb332,只剩 8 级灰,别用。)
+void postScreenDump() {
+    if (WiFi.status() != WL_CONNECTED) { Serial.println("[dump] 未连 WiFi,跳过"); return; }
+
+    auto& d = M5.Display;
+    const int w = d.width(), h = d.height();
+    const size_t len = (size_t)w * h * 3;
+    uint8_t* buf = (uint8_t*)ps_malloc(len);      // 1.5MB 只能放 PSRAM
+    if (!buf) { Serial.printf("[dump] PSRAM 分配 %u 字节失败\n", (unsigned)len); return; }
+
+    uint32_t t0 = millis();
+    d.readRect(0, 0, w, h, (void*)buf);
+    uint32_t readMs = millis() - t0;
+
+    String url = "http://" + String(OTA_HOST) + ":" + String(THUMB_PORT)
+               + "/screen?w=" + w + "&h=" + h + "&fmt=bgr888&fw=" + FW_VERSION;
+    HTTPClient http;
+    if (!http.begin(url)) { Serial.println("[dump] http.begin 失败"); free(buf); return; }
+    http.addHeader("Content-Type", "application/octet-stream");
+    int code = http.POST(buf, len);
+    String body = code > 0 ? http.getString() : String();
+    http.end();
+    free(buf);
+
+    Serial.printf("[dump] %dx%d %u字节 读取%ums → HTTP %d %s\n",
+                  w, h, (unsigned)len, (unsigned)readMs, code, body.c_str());
+}

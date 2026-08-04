@@ -47,6 +47,7 @@ static bool g_evLive = true;
 static String g_evKind, g_evSrc, g_evProject, g_evMsg, g_evMeta;
 static long g_evTs = 0;
 static volatile bool g_doOta = false;
+static volatile bool g_doDump = false;   // 调试:回传当前屏幕给网关(见 ota.cpp postScreenDump)
 
 static uint32_t g_bleDropAt = 0;   // BLE 掉线起始时刻(0=在线)
 
@@ -150,7 +151,9 @@ static void handleBleMessage(const String& s) {
     if (deserializeJson(doc, s)) return;
     const char* t = doc["t"] | "";
     if (!strcmp(t, "cmd")) {
-        if (String((const char*)(doc["cmd"] | "")).indexOf("ota") >= 0) g_doOta = true;
+        String cmd((const char*)(doc["cmd"] | ""));
+        if (cmd.indexOf("ota") >= 0) g_doOta = true;
+        if (cmd.indexOf("dump") >= 0) g_doDump = true;
         return;
     }
     if (!strcmp(t, "usage")) { applyUsage(doc); return; }
@@ -205,6 +208,7 @@ static void onMessage(char* topic, byte* payload, unsigned int len) {
     if (!strcmp(topic, TOPIC_CMD)) {
         String c((const char*)payload, len);
         if (c.indexOf("ota") >= 0) g_doOta = true;
+        if (c.indexOf("dump") >= 0) g_doDump = true;
         return;
     }
     if (!strcmp(topic, TOPIC_USAGE)) {
@@ -362,6 +366,14 @@ void loop() {
         } else {
             checkOTA();
         }
+    }
+
+    // 屏幕 dump(调试用,需 WiFi)。BLE 模式下射频互斥、WiFi 是关的,**不为它切模式** ——
+    // 切一次要断 BLE + 重连,代价远大于一次截图;调试时让设备走 WiFi 兜底即可。
+    if (g_doDump) {
+        g_doDump = false;
+        if (g_mode == MODE_BLE) Serial.println("[dump] BLE 模式下 WiFi 关闭,跳过(调试请走 WiFi 兜底)");
+        else postScreenDump();
     }
 
     // 事件 → 通知卡(live)/ 历史(补发)

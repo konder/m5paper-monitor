@@ -3,11 +3,11 @@
 // v26 起:WiFi + MQTT 常连 + PM 自动轻睡眠(WiFi modem sleep),低功耗且通知即时;全屋覆盖不受 BLE 距离限制。
 
 // 固件版本(每次要 OTA 推新时 +1;gateway 的 /fw/version 返回值 > 此值即触发更新)
-#define FW_VERSION 41
+#define FW_VERSION 42
 
 // ---- MQTT 主题 ----
 #define TOPIC_EVENT  "m5paper/events"  // 事件:done/needs_input/quota(QoS1 离线排队)
-#define TOPIC_CMD    "m5paper/cmd"     // 指令:如 ota
+#define TOPIC_CMD    "m5paper/cmd"     // 指令:ota(查更新) / dump(回传屏幕,见 tools/dump_screen.py)
 #define TOPIC_DEVICE "m5paper/device"  // 设备上报电量遥测(供实测续航)
 #define TOPIC_USAGE  "m5paper/usage"   // v39 消耗看板(retained QoS0,四路额度/流量)
 #define HISTORY_MAX  8                 // 待命屏历史事件列表最多显示/保留条数
