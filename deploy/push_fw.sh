@@ -12,7 +12,7 @@ export PATH="$HOME/Library/Python/3.9/bin:$PATH"
 VER=$(grep -E '#define[[:space:]]+FW_VERSION' "$FW/src/config.h" | awk '{print $3}')
 echo "==> 构建固件 v$VER"
 cd "$FW"
-pio run
+pio run -e PaperS3          # 显式指定:仓库里还有个 native 单测 env(无 main(),`pio run` 编不过)
 mkdir -p "$OUT"
 cp .pio/build/PaperS3/firmware.bin "$OUT/current.bin"
 echo "$VER" > "$OUT/version.txt"
