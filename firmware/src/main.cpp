@@ -12,6 +12,7 @@
 #include "secrets.h"
 #include "config.h"
 #include "types.h"
+#include "logic.h"
 #include "render.h"
 #include "power.h"
 #include "ota.h"
@@ -31,23 +32,13 @@ enum View { V_IDLE, V_NOTIFY };
 static View g_view = V_IDLE;
 static uint32_t g_notifyUntil = 0;
 
-static EventItem g_hist[HISTORY_MAX];
-static int g_histN = 0;
-static bool g_idleDirty = true;
+// 事件/看板的状态与解析逻辑住在 logic.{h,cpp}(g_hist / g_usage / g_ev* / g_doOta …),
+// 那部分不碰屏幕射频,能在 native 单测里跑。这里只留渲染节奏和模式切换相关的。
 static uint32_t g_idleRenders = 0;
 
-// v39 消耗看板。g_usageRenders 是**独立**的全刷计数器 —— 和 g_idleRenders 共用会让
+// g_usageRenders 是**独立**的全刷计数器 —— 和 g_idleRenders 共用会让
 // 两个页面的局刷/全刷节奏交错,残影攒不掉。
-static Usage g_usage;
-static bool g_usageDirty = false;
 static uint32_t g_usageRenders = 0;
-
-static volatile bool g_haveEvent = false;
-static bool g_evLive = true;
-static String g_evKind, g_evSrc, g_evProject, g_evMsg, g_evMeta;
-static long g_evTs = 0;
-static volatile bool g_doOta = false;
-static volatile bool g_doDump = false;   // 调试:回传当前屏幕给网关(见 ota.cpp postScreenDump)
 
 static uint32_t g_bleDropAt = 0;   // BLE 掉线起始时刻(0=在线)
 
@@ -60,23 +51,6 @@ static void enterBleMode();
 static void enterWifiMode();
 static bool tryBle(uint32_t waitMs);
 static void sendBattery();
-
-static String summarize(const String& msg) {
-    String s = msg; int nl = s.indexOf('\n');
-    if (nl >= 0) s = s.substring(0, nl);
-    s.trim();
-    if (s.length() > 160) s = s.substring(0, 160);
-    return s;
-}
-
-static void addHistory(const String& kind, const String& src, const String& project,
-                       const String& msg, long ts) {
-    for (int i = HISTORY_MAX - 1; i > 0; i--) g_hist[i] = g_hist[i - 1];
-    g_hist[0].kind = kind; g_hist[0].src = src; g_hist[0].project = project;
-    g_hist[0].summary = summarize(msg); g_hist[0].ts = ts;
-    if (g_histN < HISTORY_MAX) g_histN++;
-    g_idleDirty = true;
-}
 
 static void showIdle() {
     g_view = V_IDLE;
@@ -109,59 +83,7 @@ static void showNotify(const String& kind, const String& src, const String& proj
     renderNotify(kind, src, project, msg, meta, ts);
 }
 
-// ---- 事件解析(BLE / MQTT 统一置位)----
-static void setEvent(const char* kind, const char* src, const char* project,
-                     const char* msg, const char* meta, long ts, bool live) {
-    g_evKind = kind; g_evSrc = src; g_evProject = project;
-    g_evMsg = msg; g_evMeta = meta; g_evTs = ts; g_evLive = live;
-    g_haveEvent = true;
-}
-
-// ---- v39 消耗看板解析(BLE / MQTT 共用一份;两条路径必须行为一致)----
-// 只置 dirty 位,不在这里渲染 —— 这两个函数分别跑在 NimBLE 主机任务和 mqtt.loop() 里,
-// 塞一次 1-2s 的墨水屏全刷进去会直接饿死协议栈。
-static void applyUsage(JsonDocument& doc) {
-    int rev = doc["rev"] | -1;
-    if (rev >= 0 && rev == g_usage.rev) {
-        Serial.printf("[usage] rev=%d 心跳,内容未变,不重绘\n", rev);
-        return;                       // gateway 的保底心跳,内容没变 → 不刷墨水屏
-    }
-    g_usage.rev  = rev;
-    g_usage.ts   = doc["ts"] | 0;
-    g_usage.hhmm = (const char*)(doc["hhmm"] | "");
-    g_usage.foot = (const char*)(doc["foot"] | "");
-    int n = 0;
-    for (JsonObject r : doc["rows"].as<JsonArray>()) {
-        if (n >= USAGE_ROWS_MAX) break;
-        g_usage.rows[n].l   = (const char*)(r["l"]   | "");
-        g_usage.rows[n].n   = (const char*)(r["n"]   | "");
-        g_usage.rows[n].rin = (const char*)(r["rin"] | "");
-        g_usage.rows[n].rem = r["rem"] | -1;
-        n++;
-    }
-    g_usage.n = n;
-    g_usage.valid = (n > 0);
-    g_usageDirty = true;
-    Serial.printf("[usage] rx rev=%d rows=%d hhmm=%s\n", rev, n, g_usage.hhmm.c_str());
-}
-
-// BLE 桥消息:{"t":"ev"|"cmd"|"usage", ...}
-static void handleBleMessage(const String& s) {
-    JsonDocument doc;
-    if (deserializeJson(doc, s)) return;
-    const char* t = doc["t"] | "";
-    if (!strcmp(t, "cmd")) {
-        String cmd((const char*)(doc["cmd"] | ""));
-        if (cmd.indexOf("ota") >= 0) g_doOta = true;
-        if (cmd.indexOf("dump") >= 0) g_doDump = true;
-        return;
-    }
-    if (!strcmp(t, "usage")) { applyUsage(doc); return; }
-    if (strcmp(t, "ev")) return;
-    setEvent(doc["kind"] | "done", doc["src"] | "", doc["project"] | "?",
-             doc["msg"] | "", doc["meta"] | "", doc["ts"] | 0, doc["live"] | true);
-    Serial.printf("[ble-ev] kind=%s proj=%s live=%d\n", g_evKind.c_str(), g_evProject.c_str(), (int)g_evLive);
-}
+// setEvent / applyUsage / handleBleMessage / onMessage 已移到 logic.{h,cpp}(可 native 单测)
 
 // 电池模式开自动轻睡眠;WiFi 模式再叠加 WiFi modem sleep。插电全速。
 static void configurePowerSave() {
@@ -201,28 +123,6 @@ static void checkLowBatt() {
     } else if (g_usb || p >= LOW_BATT_PCT + 5) {
         alerted = false;
     }
-}
-
-// ---- MQTT(WiFi 模式)----
-static void onMessage(char* topic, byte* payload, unsigned int len) {
-    if (!strcmp(topic, TOPIC_CMD)) {
-        String c((const char*)payload, len);
-        if (c.indexOf("ota") >= 0) g_doOta = true;
-        if (c.indexOf("dump") >= 0) g_doDump = true;
-        return;
-    }
-    if (!strcmp(topic, TOPIC_USAGE)) {
-        JsonDocument ud;
-        if (deserializeJson(ud, payload, len)) return;
-        applyUsage(ud);
-        return;
-    }
-    if (strcmp(topic, TOPIC_EVENT)) return;
-    JsonDocument doc;
-    if (deserializeJson(doc, payload, len)) return;
-    setEvent(doc["kind"] | "done", doc["src"] | "", doc["project"] | "?",
-             doc["msg"] | "", doc["meta"] | "", doc["ts"] | 0, true);
-    Serial.printf("[ev] rx kind=%s proj=%s\n", g_evKind.c_str(), g_evProject.c_str());
 }
 
 static bool connectMqtt() {
@@ -387,13 +287,9 @@ void loop() {
     now = millis();
 
     // v39 看板重绘节流:gateway 只在实质变化时 bump rev(applyUsage 已按 rev 去重),
-    // 这里再压一道最短间隔。usagePainted 保证**第一帧立刻画**,不用等 2 分钟。
-    static uint32_t lastUsagePaint = 0;
-    static bool usagePainted = false;
-    if (g_usb && g_view == V_IDLE && g_usageDirty &&
-        (!usagePainted || (uint32_t)(now - lastUsagePaint) >= USAGE_REPAINT_MIN_MS)) {
-        lastUsagePaint = now;
-        usagePainted = true;
+    // 这里再压一道最短间隔。判定逻辑在 logic.cpp 的 UsageRepaintGate(可 native 单测)。
+    static UsageRepaintGate usageGate;
+    if (usageGate.shouldPaint(now, g_usb, g_view == V_IDLE, g_usageDirty, USAGE_REPAINT_MIN_MS)) {
         g_idleDirty = true;      // 交给下面统一的 showIdle 路径,避免两处渲染
     }
 
