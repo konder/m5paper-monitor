@@ -1,0 +1,76 @@
+name: CI
+
+# 为什么不用 pre-commit hook:pio 只装在 Mac Mini 上,本机(工作 Mac)没有,
+# hook 跨机跑很别扭。而 platform = native 在 Linux runner 上原生可用、不需要任何硬件。
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 宿主机测试:不碰屏幕/射频/睡眠的那部分固件代码,直接用 runner 的编译器跑
+  native-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # native_render 那个 env 要链 SDL2(M5GFX 的 Panel_sdl 后端)。
+      # Linux 上头文件在 /usr/include/SDL2,是默认搜索路径 —— platformio.ini 里那两个
+      # /opt/homebrew 路径是给 macOS 的,在这儿不存在,gcc 会静默忽略。
+      - name: 装 SDL2
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libsdl2-dev
+
+      - name: 装 PlatformIO
+        run: pip install --quiet platformio
+
+      - name: 纯逻辑单测(rev 去重 / 重绘节流 / 命令分发 / UTF-8 截断)
+        run: pio test -e native -d firmware
+
+      - name: 渲染测试(真的跑 render.cpp,产出 960x540 帧缓冲)
+        run: pio test -e native_render -d firmware
+
+      # 渲染结果留档,失败时能下载下来看到底画成什么样
+      - name: 上传渲染产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-output
+          path: /tmp/render_native.pgm
+          if-no-files-found: warn
+
+  # 设备固件编译回归。这条最容易在重构时被忽略 —— logic.cpp 抽取那次就是靠手工
+  # 跑 pio run 才确认没编坏的。
+  firmware-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # espressif32 平台 + 工具链有 1GB+,不缓存每次都要重下
+      - name: 缓存 PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: 装 PlatformIO
+        run: pip install --quiet platformio
+
+      # 真 secrets.h 是 gitignore 的(只有本机和 Mac Mini 有),CI 用模板顶上 ——
+      # 这里只关心「能不能编过」,里面的值是什么无所谓。
+      - name: 用模板顶替 secrets.h
+        run: cp firmware/include/secrets.h.example firmware/include/secrets.h
+
+      - name: 编设备固件
+        run: pio run -e PaperS3 -d firmware
