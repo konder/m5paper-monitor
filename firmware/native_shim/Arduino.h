@@ -63,8 +63,11 @@ public:
     bool operator==(const char* s) const { return v == (s ? s : ""); }
     bool operator!=(const String& o) const { return !(*this == o); }
 
-    // ArduinoJson 的 ArduinoStringAdapter 需要这两个
-    void concat(const char* s, size_t n) { v.append(s, n); }
+    // ArduinoJson 的 Writer<::String> 要用:concat 必须有可转 bool 的返回值
+    // (Arduino 原版返回 unsigned char,1=成功),写成 void 会报
+    // "value of type 'void' is not contextually convertible to 'bool'"
+    bool concat(const char* s) { v += (s ? s : ""); return true; }
+    bool concat(const char* s, size_t n) { v.append(s, n); return true; }
     char operator[](unsigned i) const { return i < v.size() ? v[i] : '\0'; }
 
     std::string v;
