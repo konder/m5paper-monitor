@@ -134,6 +134,49 @@ static void test_summarize_caps_at_160(void) {
     TEST_ASSERT_EQUAL_UINT(160, summarize(long_).length());
 }
 
+// 是不是合法 UTF-8(只判结构,够用了)
+static bool isValidUtf8(const char* s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
+        size_t need;
+        if (c < 0x80)             need = 0;
+        else if ((c >> 5) == 0x6) need = 1;
+        else if ((c >> 4) == 0xE) need = 2;
+        else if ((c >> 3) == 0x1E) need = 3;
+        else return false;                          // 落单的续接字节 / 非法首字节
+        if (need > 0 && i + need >= n) return false;  // 多字节序列被尾部切断
+        for (size_t k = 1; k <= need; k++)
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80) return false;
+        i += need + 1;
+    }
+    return true;
+}
+
+// 160 是**字节**上限,而中文一个字 3 字节 —— 160/3=53.3,所以第 54 个字正好被切两半。
+// 网关侧 framing.py 明确处理了字符边界("直接切字节会切出半个汉字"),设备侧不能漏。
+// 切碎的 UTF-8 进 EventItem::summary → renderIdle 画出来就是乱码/豆腐块。
+static void test_summarize_truncates_on_char_boundary(void) {
+    std::string cn;
+    for (int i = 0; i < 100; i++) cn += "测";     // 300 字节,远超 160
+    String out = summarize(String(cn));
+    TEST_ASSERT_TRUE_MESSAGE(out.length() <= 160, "没截到 160 字节以内");
+    TEST_ASSERT_TRUE_MESSAGE(isValidUtf8(out.c_str(), out.length()),
+                             "截断切碎了 UTF-8 —— 墨水屏会渲染出半个汉字");
+}
+
+// 中英混排时边界落在哪不固定,扫一遍长度确保每种都不切碎
+static void test_summarize_boundary_sweep(void) {
+    for (int pad = 0; pad < 6; pad++) {
+        std::string s(pad, 'a');
+        for (int i = 0; i < 100; i++) s += "字";
+        String out = summarize(String(s));
+        char msg[64];
+        snprintf(msg, sizeof msg, "pad=%d 时切碎了 UTF-8", pad);
+        TEST_ASSERT_TRUE_MESSAGE(isValidUtf8(out.c_str(), out.length()), msg);
+    }
+}
+
 // ---------------- addHistory ----------------
 
 static void test_history_newest_first_and_capped(void) {
@@ -246,6 +289,8 @@ int main(int, char**) {
 
     RUN_TEST(test_summarize_takes_first_line_and_trims);
     RUN_TEST(test_summarize_caps_at_160);
+    RUN_TEST(test_summarize_truncates_on_char_boundary);
+    RUN_TEST(test_summarize_boundary_sweep);
     RUN_TEST(test_history_newest_first_and_capped);
 
     RUN_TEST(test_mqtt_cmd_dispatch);
