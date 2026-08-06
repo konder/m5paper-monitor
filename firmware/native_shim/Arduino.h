@@ -53,6 +53,18 @@ public:
         v = v.substr(b, v.find_last_not_of(ws) - b + 1);
     }
 
+    // render.cpp 的 trunc() 用这两个:replace 把换行换成空格,remove 逐字节回删
+    void remove(unsigned index) { if (index < v.size()) v.erase(index); }
+    void remove(unsigned index, unsigned count) { if (index < v.size()) v.erase(index, count); }
+    void replace(const String& from, const String& to) {
+        if (from.v.empty()) return;
+        size_t p = 0;
+        while ((p = v.find(from.v, p)) != std::string::npos) {
+            v.replace(p, from.v.size(), to.v);
+            p += to.v.size();
+        }
+    }
+
     String& operator+=(const String& o) { v += o.v; return *this; }
     String& operator+=(const char* s) { v += (s ? s : ""); return *this; }
     friend String operator+(String a, const String& b) { a.v += b.v; return a; }

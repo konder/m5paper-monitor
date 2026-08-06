@@ -38,3 +38,9 @@ void renderBatteryPage(int batteryPct, int mv, bool charging, const char* link, 
 
 // 顶部状态提示(连接中/离线等)
 void renderStatus(const char* msg);
+
+#if defined(NATIVE_TEST)
+// 仅 native 渲染测试:把内部的 trunc() 透出来直接测。它依赖 M5.Display.textWidth,
+// 所以只能在装好 Panel_sdl 的环境里跑(见 test/test_render)。设备固件不含这段。
+String renderTruncForTest(const String& s, int maxw);
+#endif

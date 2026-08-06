@@ -83,6 +83,11 @@ static String trunc(String s, int maxw) {
     while (s.length() && tw(s + "…") > maxw) s.remove(s.length() - 1);
     return s + "…";
 }
+
+#if defined(NATIVE_TEST)
+String renderTruncForTest(const String& s, int maxw) { return trunc(s, maxw); }
+#endif
+
 static const char* stateCN(const String& st) {
     if (st == "running") return "运行中";
     if (st == "done") return "完成";
