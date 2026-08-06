@@ -37,6 +37,16 @@ FOOT_Y = 470
 CJK_FONT = "/System/Library/Fonts/PingFang.ttc"
 
 
+def wh_rect(dr, x: int, y: int, w: int, h: int, **kw) -> None:
+    """按 LovyanGFX 的 drawRect/fillRect(x, y, w, h) 语义画矩形。
+
+    ⚠️ PIL 的 rectangle([x0,y0,x1,y1]) **两端都含**,直接写 [x, y, x+w, y+h] 会多画 1px。
+    这个 off-by-one 在 2026-08-06 被 native_render 的真实渲染比对抓到:每根油量表的
+    外框和填充都比设备宽 1px、高 1px。所有矩形一律走这个函数,别再手写坐标。
+    """
+    dr.rectangle([x, y, x + w - 1, y + h - 1], **kw)
+
+
 def is_wide(ch: str) -> bool:
     """efontCN 的全宽判定:CJK / 全角标点 / 假名 等占满格,ASCII 占半格。"""
     o = ord(ch)
@@ -85,12 +95,12 @@ def draw_gauge_row(dr, y, h, r, problems):
     # 油量表:黑填充 = 剩余;rem<0 用浅灰单描边(黑空条会被误读成"余量耗尽")
     rem = r.get("rem", -1)
     if rem >= 0:
-        dr.rectangle([BAR_X, by, BAR_X + BAR_W, by + BAR_H], outline=BLACK, width=2)
+        wh_rect(dr, BAR_X, by, BAR_W, BAR_H, outline=BLACK, width=2)
         fw = (BAR_W - 6) * min(100, rem) // 100
         if fw > 0:
-            dr.rectangle([BAR_X + 3, by + 3, BAR_X + 3 + fw, by + BAR_H - 3], fill=BLACK)
+            wh_rect(dr, BAR_X + 3, by + 3, fw, BAR_H - 6, fill=BLACK)
     else:
-        dr.rectangle([BAR_X, by, BAR_X + BAR_W, by + BAR_H], outline=LGRAY, width=1)
+        wh_rect(dr, BAR_X, by, BAR_W, BAR_H, outline=LGRAY, width=1)
 
     pct = f"剩{rem}%" if rem >= 0 else "--"
     pct_end = PCT_X + ew(pct, 24)
@@ -125,7 +135,7 @@ def render(u, out="sim_usage.png"):
     rt = (u.get("hhmm", "") + "   ") if u.get("hhmm") else ""
     rt += "WiFi  87%  v39"
     draw_grid_text_r(dr, W - 18, 18, rt, 16, BLACK)
-    dr.rectangle([14, 50, W - 14, 51], fill=BLACK)
+    wh_rect(dr, 14, 50, W - 28, 2, fill=BLACK)      # 对应 render.cpp 的两条 drawFastHLine(14,50/51,SCR_W-28)
 
     rows = u.get("rows", [])
     n = len(rows)
@@ -144,7 +154,7 @@ def render(u, out="sim_usage.png"):
                 dr.line([24, y + row_h - 1, W - 24, y + row_h - 1], fill=LGRAY, width=1)
 
     # 底部 LiteLLM 单行
-    dr.rectangle([14, FOOT_Y + 4, W - 14, FOOT_Y + 5], fill=BLACK)
+    wh_rect(dr, 14, FOOT_Y + 4, W - 28, 1, fill=BLACK)   # 设备侧只有一条 drawFastHLine,不是两条
     foot = u.get("foot", "")
     ft = etrunc(foot, 24, W - 48)
     if ft != foot:
