@@ -21,6 +21,8 @@ public:
     String(const std::string& s) : v(s) {}
     String(int n) { char b[24]; snprintf(b, sizeof b, "%d", n); v = b; }
     String(long n) { char b[24]; snprintf(b, sizeof b, "%ld", n); v = b; }
+    // render.cpp 的电压显示用 String(mv/1000.0, 2)
+    String(double n, int decimals) { char b[40]; snprintf(b, sizeof b, "%.*f", decimals, n); v = b; }
 
     const char* c_str() const { return v.c_str(); }
     unsigned length() const { return (unsigned)v.size(); }

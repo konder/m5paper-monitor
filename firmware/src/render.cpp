@@ -68,13 +68,15 @@ static String fReset(long r, long now) {
 static String fAgo(long ts, long now) { long d = now - ts; if (d < 0) d = 0; return fDur(d) + "前"; }
 
 static void setFont(const lgfx::IFont* f) { M5.Display.setFont(f); }
-static int tw(const String& s) { return M5.Display.textWidth(s); }
+// 一律传 c_str():LovyanGFX 的 `const String&` 重载是 `#if defined(ARDUINO)` 圈起来的,
+// 宿主机(native_render)上不存在。设备上两者等价 —— Arduino 那个重载本身就是转发到 c_str()。
+static int tw(const String& s) { return M5.Display.textWidth(s.c_str()); }
 // 加粗:点阵字横向多描一遍,墨水屏上更清晰(透明底,背景已铺好)
 static void txt(int x, int y, const String& s, uint32_t c) {
     auto& d = M5.Display;
     d.setTextColor(c);
-    d.setCursor(x, y); d.print(s);
-    d.setCursor(x + 1, y); d.print(s);
+    d.setCursor(x, y); d.print(s.c_str());
+    d.setCursor(x + 1, y); d.print(s.c_str());
 }
 static void txtR(int xr, int y, const String& s, uint32_t c) { txt(xr - tw(s), y, s, c); }
 static String trunc(String s, int maxw) {
