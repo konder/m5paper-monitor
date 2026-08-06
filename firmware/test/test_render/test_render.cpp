@@ -115,6 +115,33 @@ static void test_trunc_keeps_utf8_intact(void) {
                              "trunc 切碎了 UTF-8 —— 墨水屏会画出半个汉字");
 }
 
+// 单个输入通过说明不了什么 —— 截断点落在哪取决于「内容 × 预算 × 字体」。
+// 扫一遍中英混排 × 各种像素预算,任何一格切碎 UTF-8 都算 trunc 有 bug。
+static void test_trunc_boundary_sweep(void) {
+    const char* bases[] = {"中文标签", "abc中文", "中a文b标c签", "一二三四五六七八九十"};
+    int bad = 0, total = 0;
+    for (const char* base : bases) {
+        for (int reps = 1; reps <= 12; reps++) {
+            String s;
+            for (int i = 0; i < reps; i++) s += base;
+            for (int maxw = 20; maxw <= 400; maxw += 17) {
+                String out = renderTruncForTest(s, maxw);
+                total++;
+                if (!isValidUtf8(out.c_str(), out.length())) {
+                    if (bad < 3)
+                        printf("[trunc] ✗ base=%s reps=%d maxw=%d → %u 字节非法\n",
+                               base, reps, maxw, out.length());
+                    bad++;
+                }
+            }
+        }
+    }
+    printf("[trunc] 扫了 %d 组,切碎 %d 组\n", total, bad);
+    char msg[80];
+    snprintf(msg, sizeof msg, "%d/%d 组切碎了 UTF-8", bad, total);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, bad, msg);
+}
+
 int main(int, char**) {
     auto cfg = M5.config();
     cfg.clear_display = false;
@@ -123,5 +150,6 @@ int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_render_usage_produces_image);
     RUN_TEST(test_trunc_keeps_utf8_intact);
+    RUN_TEST(test_trunc_boundary_sweep);
     return UNITY_END();
 }
