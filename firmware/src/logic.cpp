@@ -23,7 +23,15 @@ String summarize(const String& msg) {
     String s = msg; int nl = s.indexOf('\n');
     if (nl >= 0) s = s.substring(0, nl);
     s.trim();
-    if (s.length() > 160) s = s.substring(0, 160);
+    // 160 是**字节**上限(String::substring 是字节语义),而中文一个字 3 字节 ——
+    // 直接切会切出半个汉字,进 EventItem::summary 后 renderIdle 画出来是乱码。
+    // UTF-8 的续接字节都是 10xxxxxx,所以从切点往回退到第一个非续接字节即可。
+    // 网关侧 framing.py 也做了同样的事("截断要落在字符边界上"),两侧要一致。
+    if (s.length() > 160) {
+        int cut = 160;
+        while (cut > 0 && ((uint8_t)s[cut] & 0xC0) == 0x80) cut--;
+        s = s.substring(0, cut);
+    }
     return s;
 }
 
