@@ -50,19 +50,28 @@ tz_offset_hours = 8      # 顶栏时钟的时区偏移。Mac Mini 系统时区�
 # FW46 起设备是 **BLE-only** 的:数据全走 BLE,WiFi 只在 OTA / 屏幕 dump 时被临时借用。
 #   ble  = true  → 经原生 Swift helper 直连设备,**完全不需要 mosquitto**
 #   mqtt = true  → 已无意义(设备不再订阅 broker),除非你还有别的 MQTT 消费者
-# ⚠️ 开 ble 前先让 collector 用的那个 python 能 import espble。
-#    Mac Mini 上 collector 跑的是 /usr/bin/python3(Xcode 自带 3.9),它的 pip 太老
-#    装不了 PEP 660 editable,所以走 LaunchAgent 的 EnvironmentVariables:
-#      PYTHONPATH = /Users/nanzhang/esp-ble-link/host
-#    这样也更好 —— 跟固件 lib_deps 一样直接读 git 工作副本,不会拿到快照。
-#    (装不上 espble 时 make_channel 只会 warn 一句「BLE 渠道启动失败」然后继续,
-#     如果 mqtt 也是 false,结果是**一条渠道都没有、设备什么都收不到**。)
+# ⚠️ 开 ble 前把下面 [ble] 的 hub_cmd 指对(v48 起框架是子进程,不再需要
+#    让 collector 那个 python 能 import espble,PYTHONPATH 补丁已经删掉了)。
+#    hub_cmd 指错时 BleChannel 会**当场抛异常**,make_channel 只 warn 一句
+#    「BLE 渠道启动失败」然后继续 —— 如果 mqtt 也是 false,结果是
+#    **一条渠道都没有、设备什么都收不到**,所以启动日志里那行 [chan] 要看一眼。
 # ⚠️ helper 首次授权要在 GUI 会话里点一次(SSH 里 open 出来的拿不到 bluetoothd,
 #    现象是事件流卡在 central_created —— 不是签名问题,见 esp-ble-link pitfalls B1)。
 mqtt = false
 ble = true
 
 [ble]
+# ---- 框架在哪(v48:从 import 换成子进程)----
+# ⚠️ 这是**唯一**一处提到 esp-ble-link 的地方。m5work 的代码里零 `import espble`。
+#
+# 指向框架仓库自带的 shim。它自己处理 sys.path,所以**不需要 pip install** ——
+# 这正是这次解耦要解决的问题:collector 跑 /usr/bin/python3(Xcode 3.9),
+# 那个 pip 老到装不了 PEP 660 editable,以前只能在 LaunchAgent 里塞
+# EnvironmentVariables: PYTHONPATH=…/esp-ble-link/host,而那个补丁不进版本控制。
+#
+# 留空 = ~/esp-ble-link/host/bin/espble hubd
+hub_cmd = ""
+
 # ---- 设备清单(v47:底座换成多设备的 BleHub)----
 # 格式:"id:别名,id2:别名2"。别名可省(那就用 id 当显示名)。
 #
@@ -83,7 +92,7 @@ device_type = "m5paper"         # 广播名 = <device_type>-<id>,要和固件的
 #    **精确广播名**匹配:N 个 worker 共用一个前缀的话,谁先扫到哪台就抢哪台,
 #    别名和 id 的绑定就废了 —— 发给"甲屏"的消息可能进了乙屏。BleHub 自动用
 #    `<device_type>-<id>` 精确匹配,不需要你配。
-helper_app = ""                 # 留空 = <repo>/.build/native/M5PaperBLEHelper.app
+helper_app = ""                 # 传给 hubd 的 --app。留空 = <repo>/.build/native/M5PaperBLEHelper.app
                                 # 现在统一用单一 bundle:~/.local/espble/EspBleHub.app
 registry = ""                   # 留空 = ~/.config/espble/devices.json(设备注册表,会落盘)
 session_root = ""               # 留空 = ~/.config/espble/sessions;每台设备一个子目录

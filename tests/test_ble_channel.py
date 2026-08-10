@@ -1,202 +1,229 @@
-"""迁移到 esp-ble-link 之后,BleChannel 对外的语义有没有变。
+"""BLE 渠道:配置怎么变成命令行、方法调用怎么变成管道上的 JSON、事件回来怎么落地。
 
-v40 把链路层换成了 espble 包,这份测试盯的是**没搬走的那部分**:
-事件信封、retained/history 各自装什么、断连时哪些丢哪些留。
-链路本身(邮箱、退避、keepalive)由 espble 自己的单测覆盖,这里不重复。
+v48 起 m5work 和 esp-ble-link 之间是**进程边界**,所以这份测试的划线也跟着变:
 
-跑:  PYTHONPATH=~/esp-ble-link/host:. python3 -m pytest tests -q
+    在这里测        配置 → hubd 命令行、方法 → 指令 JSON、事件 JSON → 内部状态、
+                   子进程监护(死了会不会重启、close 会不会留孤儿)、事件信封
+    **不**在这里测   重连补推顺序、历史环上限、离线丢弃、长中文按字节截断、
+                   按精确名匹配、每设备独立 session_dir
+                   —— 那些是**框架行为**,进程边界之后这边既测不到也不该测。
+                      对应覆盖(删之前逐条核对过):
+                        test_channel.py::test_reconnect_replays_retained_then_history
+                        test_channel.py::test_history_is_bounded
+                        test_channel.py::test_immediate_messages_dropped_while_offline
+                        test_framing.py::test_truncation_lands_on_char_boundary
+                        test_hub.py::test_session_dirs_must_differ
+                        test_hub.py::test_adopt_registry_rehydrates_after_restart
+
+跑:  python3 -m pytest tests -q          # ⚠️ 不再需要 PYTHONPATH 指向框架
 """
 import json
+import os
+import shlex
+import subprocess
+import sys
+import time
 
 import pytest
 
-import espble.hub as hubmod
+import event_hub.channels.ble as blemod
+from event_hub.channels.ble import (BleChannel, build_argv, ev_envelope,
+                                    parse_devices)
 
-from event_hub.channels.ble import BleChannel, ev_envelope, parse_devices
+STUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stub_hubd.py")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-class FakeLink:
-    """替掉 espble.BleLink,只记录发了什么。"""
+def wait_for(pred, timeout=6.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return False
 
-    def __init__(self, device, **kw):
-        self.device = device
-        self.kw = kw
-        self.connected = True
-        self.queued = []       # send_soon
-        self.blocking = []     # send_blocking(补推走这条)
-        self.started = False
-        self.closed = False
-        self.on_connect = None
-        self.keepalive_provider = None
-        self.fatal_error = ""
 
-    def start(self):
-        self.started = True
-
-    def send_soon(self, line, *, queue_while_offline=False):
-        if not queue_while_offline and not self.connected:
-            return False
-        self.queued.append(line)
-        return True
-
-    def send_blocking(self, line):
-        self.blocking.append(line)
-        return self.connected
-
-    def clear_outbox(self):
-        self.queued.clear()
-
-    def wait_connected(self, timeout=40.0):
-        return self.connected
-
-    def close(self):
-        self.closed = True
+def cmds(path) -> list:
+    """假 hubd 录下来的指令。"""
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as fh:
+        return [json.loads(l) for l in fh if l.strip()]
 
 
 @pytest.fixture
-def ch(monkeypatch, tmp_path):
-    """一台设备的 BleChannel。
+def chan(tmp_path, monkeypatch):
+    """接着假 hubd 的 BleChannel 工厂。返回 (渠道, 指令录音文件路径)。"""
+    record = tmp_path / "cmds.jsonl"
+    monkeypatch.setenv("STUB_HUBD_RECORD", str(record))
+    # TELEMETRY_LOG 是 import 时求值的,所以要改模块属性而不是环境变量
+    monkeypatch.setattr(blemod, "TELEMETRY_LOG", str(tmp_path / "telemetry.log"))
+    made = []
 
-    ⚠️ registry / session_root **必须指到 tmp_path**。BleChannel 现在的底座是
-    BleHub,它会把注册表落盘 —— 用默认路径就会往真实的
-    ~/.config/espble/devices.json 里写测试设备,污染生产环境。
+    def make(devices="c119cc:看板", **extra):
+        ch = BleChannel({"ble": dict(
+            hub_cmd=f"{shlex.quote(sys.executable)} {shlex.quote(STUB)}",
+            devices=devices, helper_app=str(tmp_path / "X.app"),
+            registry=str(tmp_path / "devices.json"),
+            session_root=str(tmp_path / "sessions"), **extra)})
+        made.append(ch)
+        return ch, str(record)
+
+    yield make
+    for ch in made:
+        ch.close()
+
+
+# ---- 解耦本身 ----
+
+def test_the_framework_is_never_imported_into_this_process():
+    """解耦的机械证据。
+
+    ⚠️ 不能用「不带 PYTHONPATH 能不能跑」当判据 —— 开发机上 espble 是 pip 装了的
+    (生产机 Mac Mini 才是没装的那台),那样测什么都能过。所以直接查 sys.modules,
+    而且起一个干净解释器,免得被同一次 pytest 里别的 import 污染。
     """
-    monkeypatch.setattr(hubmod, "BleLink", FakeLink)   # BleHub 内部实例化的就是这个
-    return BleChannel({"ble": {
-        "devices": "aaa111:测试屏",
-        "registry": str(tmp_path / "devices.json"),
-        "session_root": str(tmp_path / "sessions"),
-    }})
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import event_hub.channels.ble, sys;"
+         "print(any(m == 'espble' or m.startswith('espble.') for m in sys.modules))"],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "False", "espble 又被 import 进来了 —— 解耦破了"
 
 
-def dl(ch):
-    """唯一那台设备的 DeviceLink(多设备下每台自带 link + channel)。"""
-    links = list(ch._hub._links.values())
-    assert len(links) == 1, f"这个夹具只登记一台设备,实际 {len(links)} 台"
-    return links[0]
+def test_config_becomes_a_hubd_command_line():
+    argv = build_argv({"hub_cmd": "/x/espble hubd", "devices": "aaa:甲,bbb",
+                       "device_type": "m5paper", "helper_app": "/x/H.app",
+                       "history_n": 3, "scan_timeout": 9})
+    assert argv[:3] == ["/x/espble", "hubd", "--app"]
+    # 设备清单走命令行而不是启动后补发指令 —— 这样 hubd 每次重启都自带登记,
+    # 监护逻辑不需要记住"我登记过什么"
+    assert argv[argv.index("--device") + 1] == "aaa:甲"
+    assert "bbb" in argv                          # 别名可省,照样登记
+    assert argv[argv.index("--history-n") + 1] == "3"
+    assert argv[argv.index("--scan-timeout") + 1] == "9.0"
 
 
-def lk(ch):
-    return dl(ch).link
+def test_a_missing_hub_command_fails_loudly_at_construction():
+    # 静默失败会表现成"渠道起来了但什么都不动",而那和管道没 flush、设备没广播
+    # 长得一模一样。宁可当场炸,并且把修法写进异常里。
+    with pytest.raises(RuntimeError, match="hub_cmd"):
+        BleChannel({"ble": {"hub_cmd": "/绝对不存在的路径/espble hubd"}})
 
 
-def sent(ch):
-    return [json.loads(x) for x in lk(ch).queued]
+# ---- 方法 → 指令 ----
+
+def test_usage_goes_out_as_a_retained_state(chan):
+    ch, record = chan()
+    ch.publish_usage({"rev": 7, "pct": 60})
+    assert wait_for(lambda: cmds(record))
+    cmd = cmds(record)[0]
+    # retained 而不是普通发送:设备每次(重)连上都要被补推最新看板
+    assert cmd["op"] == "set_retained_all" and cmd["key"] == "usage"
+    assert cmd["obj"] == {"t": "usage", "rev": 7, "pct": 60}
 
 
-# ---- 装配 ----
-
-def test_link_is_started_after_callbacks_are_wired(ch):
-    # 顺序要紧:先接 on_connect 再 start,否则首次连接会漏掉补推
-    assert lk(ch).on_connect is not None
-    assert lk(ch).keepalive_provider is not None
-    assert lk(ch).started
-
-
-def test_each_device_is_matched_by_exact_name_not_prefix(ch):
-    """v47:多设备下每个 worker 必须按**精确广播名**匹配,不能按前缀。
-
-    v40 单设备时用的是 `name_prefix="m5paper-"`。多设备下那样做是错的:
-    N 个 worker 全都拿同一个前缀,谁先扫到哪台就抢哪台 —— 别名和 id 的绑定就废了,
-    发给"甲屏"的消息可能进了乙屏。所以 BleHub 用 `<type>-<id>` 精确匹配。
-    """
-    d = lk(ch).device
-    assert d.device_name == "m5paper-aaa111"
-    assert d.name_prefix is None
+def test_events_go_out_as_publish_all_so_they_enter_each_history_ring(chan):
+    ch, record = chan()
+    ch.publish_event({"kind": "done", "src": "codex", "project": "p", "msg": "完事",
+                      "meta": "", "ts": 3})
+    assert wait_for(lambda: cmds(record))
+    cmd = cmds(record)[0]
+    # 刻意不是 broadcast:broadcast 只"现在发一次",publish_all 才进历史环 ——
+    # 设备离线期间错过的那几条,要靠历史环在重连后补回来
+    assert cmd["op"] == "publish_all"
+    assert cmd["obj"]["t"] == "ev" and cmd["obj"]["live"] is True
+    assert cmd["obj"]["msg"] == "完事"
 
 
-def test_no_protocol_details_are_restated_here(ch):
-    """m5work 不该自己复述协议细节 —— UUID、帧上限、分隔符兼容一律用框架默认值。
-
-    在两处各写一份的下场:改了一边忘了另一边。而且 config.h 里那个
-    `#define NUS_RX` 曾经和框架的同名声明撞车(宏不认 namespace)。
-    """
-    d = lk(ch).device
-    assert d.service_uuid is None and d.rx_uuid is None and d.tx_uuid is None
-    # FW40 的 notify 会自己补分隔符,不需要「猜边界」的兼容模式
-    assert d.accept_unterminated is False
-
-
-# ---- 渠道语义 ----
-
-def test_publish_state_is_a_noop(ch):
-    ch.publish_state({"anything": 1})
-    assert lk(ch).queued == []      # 设备 v23 起就不消费全量快照了
-
-
-def test_publish_usage_goes_out_and_is_retained(ch):
-    ch.publish_usage({"rev": 7, "rows": []})
-    assert sent(ch)[0] == {"t": "usage", "rev": 7, "rows": []}
-    # 同时进 retained:重连补推 + 当 keepalive 帧
-    assert json.loads(dl(ch).channel._keepalive_line())["rev"] == 7
-
-
-def test_publish_event_wraps_in_envelope_with_live_true(ch):
-    ch.publish_event({"kind": "done", "src": "codex", "project": "p",
-                      "msg": "构建完成", "meta": "3m", "ts": 111})
-    ev = sent(ch)[0]
-    assert ev["t"] == "ev" and ev["live"] is True
-    assert ev["msg"] == "构建完成" and ev["project"] == "p" and ev["ts"] == 111
-
-
-def test_reconnect_replays_usage_then_history_with_live_false(ch):
-    ch.publish_usage({"rev": 3})
-    ch.publish_event({"kind": "done", "project": "a", "msg": "一", "ts": 1})
-    ch.publish_event({"kind": "done", "project": "b", "msg": "二", "ts": 2})
-
-    lk(ch).blocking.clear()
-    lk(ch).on_connect(lk(ch))          # 模拟(重)连上
-    replayed = [json.loads(x) for x in lk(ch).blocking]
-
-    assert replayed[0]["t"] == "usage"     # 先状态后列表,否则会闪一下空看板
-    assert [x["msg"] for x in replayed[1:]] == ["一", "二"]
-    # live=false → 设备只把它放进历史列表,不再蜂鸣、不再弹全屏卡
-    assert all(x["live"] is False for x in replayed[1:])
-
-
-def test_history_is_capped_at_history_n(ch):
-    for i in range(12):
-        ch.publish_event({"kind": "done", "project": "p", "msg": str(i), "ts": i})
-    lk(ch).blocking.clear()
-    lk(ch).on_connect(lk(ch))
-    msgs = [json.loads(x)["msg"] for x in lk(ch).blocking]
-    assert msgs == [str(i) for i in range(4, 12)]      # 默认 history_n=8
-
-
-def test_events_are_dropped_while_offline_but_still_replayable(ch):
-    lk(ch).connected = False
-    ch.publish_event({"kind": "done", "project": "p", "msg": "离线时来的", "ts": 9})
-    assert lk(ch).queued == []           # 不排队:攒着会在重连时一次灌爆设备
-    lk(ch).connected = True
-    lk(ch).on_connect(lk(ch))
-    assert json.loads(lk(ch).blocking[0])["msg"] == "离线时来的"   # 但历史补得回来
-
-
-def test_ota_command_queues_even_while_offline(ch):
-    lk(ch).connected = False
+def test_cmd_with_a_target_is_unicast_and_without_one_is_broadcast(chan):
+    ch, record = chan(devices="aaa:甲屏,bbb:乙屏")
+    ch.send_cmd("ota", target="甲屏")
     ch.send_cmd("ota")
-    assert sent(ch) == [{"t": "cmd", "cmd": "ota"}]     # 指令值得等
+    assert wait_for(lambda: len(cmds(record)) == 2)
+    one, both = cmds(record)
+    assert one["op"] == "send" and one["target"] == "甲屏"
+    assert both["op"] == "broadcast"
+    # 指令"值得等",所以断连时也排队(状态帧过期即无用,不排)
+    assert one["queue_offline"] is True and both["queue_offline"] is True
 
 
-def test_long_chinese_message_is_trimmed_to_device_ring_budget(ch):
-    from espble import DEFAULT_LINE_LIMIT
-    ch.publish_event({"kind": "done", "project": "p", "msg": "中" * 1200, "ts": 1})
-    line = lk(ch).queued[0]
-    # 上限由框架按设备环形缓冲算出(limit_for_ring),这里不重复那个数字
-    assert len(line.encode("utf-8")) <= DEFAULT_LINE_LIMIT
-    # 必须切在字符边界上,否则设备侧 UTF-8 解码得到乱码
-    assert json.loads(line)["msg"].endswith("…")
+def test_publish_state_puts_nothing_on_the_wire(chan):
+    ch, record = chan()
+    ch.publish_state({"anything": 1})
+    time.sleep(0.3)
+    assert cmds(record) == []      # 设备 v23 起就不消费全量快照了,发了纯属白占带宽
 
 
-def test_close_shuts_the_link_down(ch):
-    link = lk(ch)          # 先拿到 —— close() 会把 hub 的 _links 清空
+# ---- 事件 → 内部状态 ----
+
+def test_connected_reads_the_pushed_snapshot_not_the_pipe(chan):
+    ch, _ = chan()
+    # hubd 启动就推 ready,所以构造完就知道谁在线。这个属性会被
+    # MultiChannel.describe() 在 collector 主循环里读 —— 必须是纯内存的,
+    # 否则一个卡住的 hubd 就能把看板挂死。
+    assert wait_for(lambda: ch.connected)
+    assert list(ch._devices) == ["c119cc"]
+
+
+def test_connected_is_false_when_no_device_is_up(chan, tmp_path, monkeypatch):
+    emit = tmp_path / "emit.jsonl"
+    emit.write_text(json.dumps({"event": "status", "devices": {
+        "c119cc": {"alias": "看板", "connected": False}}}) + "\n", encoding="utf-8")
+    monkeypatch.setenv("STUB_HUBD_EMIT", str(emit))
+    ch, _ = chan()
+    assert wait_for(lambda: ch._devices and not ch.connected)
+
+
+def test_telemetry_lands_with_the_device_id_so_two_screens_dont_mix(chan, tmp_path,
+                                                                    monkeypatch):
+    emit = tmp_path / "emit.jsonl"
+    emit.write_text(json.dumps({"event": "message", "device": "c119cc",
+                                "label": "看板", "line": '{"pct":100}'}) + "\n",
+                    encoding="utf-8")
+    monkeypatch.setenv("STUB_HUBD_EMIT", str(emit))
+    chan()
+    log = tmp_path / "telemetry.log"
+    assert wait_for(lambda: log.exists() and log.read_text(encoding="utf-8").strip())
+    assert "c119cc" in log.read_text(encoding="utf-8")
+
+
+def test_an_unknown_event_kind_does_not_break_the_stream(chan, tmp_path, monkeypatch):
+    emit = tmp_path / "emit.jsonl"
+    emit.write_text("\n".join([
+        json.dumps({"event": "以后新增的事件类型"}),
+        json.dumps({"event": "status", "devices": {"c119cc": {"connected": True}}}),
+    ]) + "\n", encoding="utf-8")
+    monkeypatch.setenv("STUB_HUBD_EMIT", str(emit))
+    ch, _ = chan()
+    # 框架加了新事件类型,不该让老消费方就此失联
+    assert wait_for(lambda: ch.connected)
+
+
+# ---- 子进程监护 ----
+
+def test_a_dead_hubd_is_restarted(chan, monkeypatch):
+    monkeypatch.setattr(blemod, "RESTART_BACKOFF", (0.2,))
+    monkeypatch.setenv("STUB_HUBD_DIE_AFTER", "0.3")
+    ch, _ = chan()
+    first = ch._proc.pid
+    # 框架侧崩了不能让看板永久失联 —— 这正是进程边界换来的好处,但得真验一次
+    assert wait_for(lambda: ch._proc is not None and ch._proc.pid != first, timeout=8)
+
+
+def test_close_shuts_the_child_down_instead_of_orphaning_it(chan):
+    ch, _ = chan()
+    proc = ch._proc
     ch.close()
-    assert link.closed
+    # 关 stdin 给 EOF,让 hubd 自己把 helper 进程带走再退出;直接 kill 会留一批孤儿
+    assert proc.poll() is not None
 
 
-# ---- 多设备(v47:底座换成 BleHub)----
+# ---- 纯 m5work 的东西 ----
 
-@pytest.mark.parametrize("spec,want", [
+@pytest.mark.parametrize("spec, want", [
     ("c119cc:看板", [("c119cc", "看板")]),
     ("c119cc", [("c119cc", "")]),                       # 别名可省
     ("a:甲, b:乙 ,c", [("a", "甲"), ("b", "乙"), ("c", "")]),
@@ -209,67 +236,9 @@ def test_parse_devices(spec, want):
     assert parse_devices(spec) == want
 
 
-@pytest.fixture
-def two(monkeypatch, tmp_path):
-    monkeypatch.setattr(hubmod, "BleLink", FakeLink)
-    return BleChannel({"ble": {
-        "devices": "aaa111:甲屏,bbb222:乙屏",
-        "registry": str(tmp_path / "devices.json"),
-        "session_root": str(tmp_path / "sessions"),
-    }})
-
-
-def test_two_devices_get_separate_links_and_session_dirs(two):
-    links = list(two._hub._links.values())
-    assert len(links) == 2
-    dirs = {l.link.device.session_dir for l in links}
-    assert len(dirs) == 2, "session_dir 必须按设备分,否则 helper 会互相误杀"
-
-
-def test_usage_and_events_fan_out_to_every_device(two):
-    two.publish_usage({"rev": 7})
-    two.publish_event({"kind": "done", "project": "p", "msg": "好了", "ts": 1})
-    for d in two._hub._links.values():
-        lines = [json.loads(x) for x in d.link.queued]
-        assert {"t": "usage", "rev": 7} in lines
-        assert any(x.get("msg") == "好了" for x in lines)
-
-
-def test_cmd_can_target_one_device_by_alias(two):
-    two.send_cmd("ota", target="乙屏")
-    got = {i: [json.loads(x) for x in d.link.queued]
-           for i, d in two._hub._links.items()}
-    assert got["bbb222"] == [{"t": "cmd", "cmd": "ota"}]
-    assert got["aaa111"] == [], "单点不该发给别人"
-
-
-def test_cmd_without_target_broadcasts(two):
-    two.send_cmd("ota")
-    for d in two._hub._links.values():
-        assert [json.loads(x) for x in d.link.queued] == [{"t": "cmd", "cmd": "ota"}]
-
-
-def test_connected_is_true_when_any_device_is_up(two):
-    a, b = two._hub._links.values()
-    a.link.connected = b.link.connected = False
-    assert two.connected is False
-    b.link.connected = True
-    assert two.connected is True          # 有一台在线就算通
-
-
-def test_registry_survives_restart_and_is_adopted(monkeypatch, tmp_path):
-    """collector 重启后必须把设备接管回来,而不是"记得有设备但没人连"。"""
-    monkeypatch.setattr(hubmod, "BleLink", FakeLink)
-    cfg = {"ble": {"devices": "aaa111:甲屏",
-                   "registry": str(tmp_path / "devices.json"),
-                   "session_root": str(tmp_path / "sessions")}}
-    first = BleChannel(cfg)
-    first.close()
-
-    # 第二次**不给** devices,全靠注册表 —— adopt_registry 该把它捡回来
-    cfg2 = dict(cfg)
-    cfg2["ble"] = dict(cfg["ble"], devices="")
-    second = BleChannel(cfg2)
-    assert list(second._hub.status()) == ["aaa111"]
-    assert second._hub.registry.get("甲屏").device_id == "aaa111"
-    second.close()
+def test_ev_envelope_matches_the_firmware_fields():
+    # 字段名必须和固件 handleBleMessage 对得上,少一个设备那格就是空白
+    assert ev_envelope({"kind": "done", "src": "codex", "project": "p",
+                        "msg": "m", "meta": "x", "ts": 9}, live=False) == {
+        "t": "ev", "live": False, "kind": "done", "src": "codex",
+        "project": "p", "msg": "m", "meta": "x", "ts": 9}

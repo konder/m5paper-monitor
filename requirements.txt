@@ -1,10 +1,11 @@
-# collector 本体只用标准库;这两个是可选渠道/工具的依赖。
+# collector 本体只用标准库。
 #
-# BLE 渠道(v40 起链路层来自通用框架 esp-ble-link):
-#   框架尚未开源,先装本地路径 ——
-#     pip install -e ~/esp-ble-link/host
-#   push 到 GitHub 之后换成:
-#     espble @ git+https://github.com/konder/esp-ble-link.git#subdirectory=host
+# BLE 渠道:**不需要装任何东西**。
+#   v48 起链路层(esp-ble-link)是当子进程调的,不是 import 的 ——
+#   在 config.toml 的 [ble] 里把 hub_cmd 指到框架仓库自带的 shim 就行:
+#     hub_cmd = "/Users/你/esp-ble-link/host/bin/espble hubd"
+#   git clone https://github.com/konder/esp-ble-link 之后即可用,无需 pip。
+#   (刻意不走 pip:collector 跑 /usr/bin/python3,那个 pip 装不了 editable。)
 #
 # MQTT 渠道:
 paho-mqtt
