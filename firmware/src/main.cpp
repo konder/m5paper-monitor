@@ -118,14 +118,19 @@ static void sendBattery() {
     //   st  = BLE 协议栈还在不在。**BLE-only 下 st=0 就是「设备已失联」** ——
     //         没有 WiFi 兜底了,栈掉了就再也没人能连上它,这是最该报警的一个位。
     // 没有 link 字段了:只有一条链路,写死一个 "ble" 没有信息量(屏幕上的 "BLE…" 才有)。
-    char buf[200];
+    // sd/ar 是框架可见性看门狗的战绩,**非 0 就说明设备本来会失联**:
+    //   sd = 「以为连着、其实早断了」被纠正(对端进程被杀、主机崩,断连回调丢了)
+    //   ar = 「没连着又没广播」被重新拉起广播
+    // BLE-only 没有 WiFi 兜底,失联就只能接 USB,所以这两个数值得一直盯着。
+    char buf[220];
     snprintf(buf, sizeof(buf),
         "{\"pct\":%d,\"mv\":%d,\"up\":%lu,\"usb\":%d,\"v\":%d,\"g5\":%d,\"chg\":%d,\"ls\":%d"
-        ",\"c\":%lu,\"d\":%lu,\"st\":%d}",
+        ",\"c\":%lu,\"d\":%lu,\"st\":%d,\"sd\":%lu,\"ar\":%lu}",
         batteryPercent(), M5.Power.getBatteryVoltage(), (unsigned long)(millis() / 1000), g_usb ? 1 : 0,
         FW_VERSION, analogReadMilliVolts(PIN_USB_DET), (int)M5.Power.isCharging(), g_usb ? 0 : 1,
         (unsigned long)espble::stats().connects, (unsigned long)espble::stats().disconnects,
-        espble::started() ? 1 : 0);
+        espble::started() ? 1 : 0,
+        (unsigned long)espble::stats().staleDrops, (unsigned long)espble::stats().advRestarts);
     // 未连接时 notify() 静默丢弃 —— 没关系,中枢重连后会拿到下一个周期的。
     espble::notify(String(buf));
     Serial.printf("[bat] %s\n", buf);
