@@ -63,13 +63,32 @@ mqtt = false
 ble = true
 
 [ble]
-# ⚠️ **别设 device_name。** 它在 helper 的匹配里优先级高于 name_prefix,一旦写错就是
-# 「明明扫到了设备却报 timed out scanning for <你写的名字>」。这里以前默认写死
-# "M5PaperNotify",那是 FW41 之前的名字,FW41 起固件从 efuse MAC 派生广播名。
-name_prefix = "m5paper-"        # 固件 BLE_TYPE + efuse MAC 后 3 字节 → m5paper-c119cc
+# ---- 设备清单(v47:底座换成多设备的 BleHub)----
+# 格式:"id:别名,id2:别名2"。别名可省(那就用 id 当显示名)。
+#
+# ⚠️ 为什么是这种扁平字符串而不是 TOML 数组:collector 的配置解析器 _tiny_toml
+#    **只支持 [section] + 标量 key = value**,没有数组、没有 [[array of tables]]。
+#    (collector 跑在 /usr/bin/python3 = Xcode 3.9,没有 tomllib,所以它就是生产解析器。)
+#
+# id 就是固件广播名的后缀:BLE_TYPE + efuse MAC 后 3 字节 → `m5paper-c119cc` 的 `c119cc`。
+# 不知道 id 就跑一下:
+#    espble scan --app ~/.local/espble/EspBleHub.app --scan-timeout 30
+#
+# ⚠️ 别名会被绑到 id 上并落进注册表,之后可以用别名当发送目标(hub.send("看板", …))。
+#    重名会被拒绝 —— 否则路由无法确定。
+devices = "c119cc:看板"
+device_type = "m5paper"         # 广播名 = <device_type>-<id>,要和固件的 BLE_TYPE 一致
+
+# ⚠️ **注意这里没有 device_name / name_prefix 了。** 多设备下每个 worker 必须按
+#    **精确广播名**匹配:N 个 worker 共用一个前缀的话,谁先扫到哪台就抢哪台,
+#    别名和 id 的绑定就废了 —— 发给"甲屏"的消息可能进了乙屏。BleHub 自动用
+#    `<device_type>-<id>` 精确匹配,不需要你配。
 helper_app = ""                 # 留空 = <repo>/.build/native/M5PaperBLEHelper.app
                                 # 现在统一用单一 bundle:~/.local/espble/EspBleHub.app
-session_dir = ""                # 留空 = ~/.config/m5paper-monitor/ble-session
+registry = ""                   # 留空 = ~/.config/espble/devices.json(设备注册表,会落盘)
+session_root = ""               # 留空 = ~/.config/espble/sessions;每台设备一个子目录
+                                # ⚠️ 每设备独立 session_dir 是多进程互不干扰的关键 ——
+                                #    helper 按 session-dir 认自己的进程,共用会互相误杀
 reconnect_sec = 5               # 前几次的重试间隔(掉线就丢掉整个 helper 进程重开)
 backoff_max_sec = 45            # 连续失败 5 次后放缓到这个间隔。
                                 # (FW46 之前这里有个坑:设备每 5 分钟只广播 15s,

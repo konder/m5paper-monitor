@@ -49,11 +49,14 @@ DEFAULTS = {
     # FW46 起设备是 BLE-only 的(WiFi 只在 OTA/dump 时临时借用),mqtt 渠道对设备
     # 已经没有用了,所以默认改成只开 ble。
     "channels": {"mqtt": False, "ble": True},
-    # ⚠️ device_name 必须留空。它在 helper 的匹配里**优先级高于 name_prefix**,
-    #    而这里以前写死 "M5PaperNotify" —— 那是 FW41 之前的名字。FW41 起身份由固件
-    #    从 efuse MAC 派生成 `m5paper-<后3字节>`,于是这个陈旧默认值让 BLE 渠道一开
-    #    就报 "timed out scanning for M5PaperNotify",而设备明明在广播、就在扫描结果里。
-    "ble": {"device_name": "", "name_prefix": "m5paper-", "helper_app": "", "session_dir": "",
+    # v47:底座是 BleHub(多设备)。设备清单写在 devices 里,格式 "id:别名,id2:别名2"
+    # —— 用扁平字符串是因为上面那个 _tiny_toml **不支持数组/嵌套表**。
+    # id 就是固件广播名的后缀(`m5paper-c119cc` → `c119cc`,来自 efuse MAC 后 3 字节),
+    # 用 `espble scan --app <bundle>` 能看到。
+    # 注册表会把登记结果落盘,所以 collector 重启后靠 adopt_registry 自己捡回来,
+    # devices 只是"首次登记 + 声明式兜底"。
+    "ble": {"devices": "", "device_type": "m5paper", "helper_app": "",
+            "registry": "", "session_root": "",
             "reconnect_sec": 5, "keepalive_sec": 30, "history_n": 8, "scan_timeout": 20},
 }
 
