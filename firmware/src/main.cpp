@@ -122,15 +122,24 @@ static void sendBattery() {
     //   sd = 「以为连着、其实早断了」被纠正(对端进程被杀、主机崩,断连回调丢了)
     //   ar = 「没连着又没广播」被重新拉起广播
     // BLE-only 没有 WiFi 兜底,失联就只能接 USB,所以这两个数值得一直盯着。
-    char buf[220];
+    // v48 加的三个是**接收侧**统计,专门用来判「连上约 1 秒就断」是不是被灌爆:
+    //   rd = rxDroppedBytes,环形缓冲满而丢弃。**非 0 就是主循环排空太慢**(见 A2)
+    //   rf = rxFrames,成功组出的完整帧 —— 给 rd 当分母,不然不知道 rd 严不严重
+    //   ro = rxOversize,超过 maxFrameBytes 被整条丢弃的帧
+    // 判据是阳性的:rd 一直 0 就能**排除**接收侧被打爆这条线,省得继续猜。
+    const espble::LinkStats& st = espble::stats();
+    char buf[280];
     snprintf(buf, sizeof(buf),
         "{\"pct\":%d,\"mv\":%d,\"up\":%lu,\"usb\":%d,\"v\":%d,\"g5\":%d,\"chg\":%d,\"ls\":%d"
-        ",\"c\":%lu,\"d\":%lu,\"st\":%d,\"sd\":%lu,\"ar\":%lu}",
+        ",\"c\":%lu,\"d\":%lu,\"st\":%d,\"sd\":%lu,\"ar\":%lu"
+        ",\"rd\":%lu,\"rf\":%lu,\"ro\":%lu}",
         batteryPercent(), M5.Power.getBatteryVoltage(), (unsigned long)(millis() / 1000), g_usb ? 1 : 0,
         FW_VERSION, analogReadMilliVolts(PIN_USB_DET), (int)M5.Power.isCharging(), g_usb ? 0 : 1,
-        (unsigned long)espble::stats().connects, (unsigned long)espble::stats().disconnects,
+        (unsigned long)st.connects, (unsigned long)st.disconnects,
         espble::started() ? 1 : 0,
-        (unsigned long)espble::stats().staleDrops, (unsigned long)espble::stats().advRestarts);
+        (unsigned long)st.staleDrops, (unsigned long)st.advRestarts,
+        (unsigned long)st.rxDroppedBytes, (unsigned long)st.rxFrames,
+        (unsigned long)st.rxOversize);
     // 未连接时 notify() 静默丢弃 —— 没关系,中枢重连后会拿到下一个周期的。
     espble::notify(String(buf));
     Serial.printf("[bat] %s\n", buf);
