@@ -1,10 +1,24 @@
-// M5PaperS3 —— 双模事件通知端(v30):BLE 优先(低功耗即时)+ WiFi 兜底,射频互斥
-// 常态:BLE 连 Mac Mini 中枢(~1-5mA,即时);BLE 连不上→WiFi+MQTT 兜底(~20mA);
-// WiFi 兜底时定时回试 BLE,连上则切回。OTA 走 WiFi(BLE 模式收到 cmd=ota 临时切 WiFi)。
+// M5PaperS3 —— BLE-only 事件通知端(v46)。
+//
+// **只有一个常驻链路:BLE**(连 Mac Mini 中枢,~1-5mA,即时)。数据(usage/ev/cmd)全走 BLE。
+// WiFi 不再是一个「模式」,而是一件**临时借用射频**去干的事 —— 只有 OTA 和屏幕 dump
+// 需要它,干完立刻还给 BLE(见 withWifi)。
+//
+// v46 拿掉了 v30 那套「BLE 掉线 60s → 切 WiFi+MQTT 常驻 → 每 5 分钟回试 BLE」的双模状态机。
+// 原因是它自相矛盾:射频互斥,常驻 WiFi 让 BLE 只能每 300s 挤出 15s 广播(5% 占空比),
+// 而主机的重连退避跟这个窄窗口互相错过 —— 实测中枢连 240s 一次都没连上,
+// 而连续扫描一扫就到(-48 dBm)。BLE 常驻广播后主机秒连,这类时序错配从根上消失。
+// 顺带:`espble::end()` 从「每 5 分钟必走」变成「只有 OTA/dump 才走」,
+// A13 那类拆栈 bug 的暴露面也一起缩小了。
+//
+// ⚠️ **代价(老板明确选择):没有不依赖 BLE 的自主更新通道了。** 以前开机走 WiFi 兜底时
+// 会顺手 checkOTA(),那是一条 BLE 坏了也能远程救回来的路。现在 OTA 只能靠 BLE 下发
+// cmd=ota —— 刷坏了只能接 USB(而这块板的 USB 有 download 模式锁死的历史,见 A11)。
+// 改这个文件前想清楚:**你正在动的是唯一的远程入口。**
+//
 // 保留:EPD 关电省电 + 电池模式大电量待机页。
 #include <M5Unified.h>
 #include <WiFi.h>
-#include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <esp_pm.h>
 #include <esp_wifi.h>
@@ -22,11 +36,11 @@
 RTC_DATA_ATTR uint32_t g_bootCount = 0;
 static bool g_usb = true;
 
-enum Mode { MODE_BLE, MODE_WIFI };
-static Mode g_mode = MODE_BLE;
-
-static WiFiClient wifiClient;
-static PubSubClient mqtt(wifiClient);
+// v46:没有 Mode 了 —— BLE 是唯一常驻链路,WiFi 是临时借用(见 withWifi)。
+// MQTT 客户端也一并去掉:usage/ev/cmd 全部经 BLE 到达(handleBleMessage 与旧的
+// onMessage 处理的是同样三种消息,且多支持 live 标志用于历史重放)。
+// 注:logic.cpp 里的 onMessage() 及其 7 个单测暂时留着(纯解析函数,不再被调用)——
+// 那几个测试盯着真实的子串匹配 bug("du" 不该匹配 dump),不值得跟这次改动一起删。
 
 enum View { V_IDLE, V_NOTIFY };
 static View g_view = V_IDLE;
@@ -40,23 +54,20 @@ static uint32_t g_idleRenders = 0;
 // 两个页面的局刷/全刷节奏交错,残影攒不掉。
 static uint32_t g_usageRenders = 0;
 
-static uint32_t g_bleDropAt = 0;   // BLE 掉线起始时刻(0=在线)
-
 // ---- 前向声明 ----
 static void showIdle();
 static void showNotify(const String&, const String&, const String&, const String&, const String&, long);
 static void configurePowerSave();
-static bool connectMqtt();
-static void enterBleMode();
-static void enterWifiMode();
-static bool tryBle(uint32_t waitMs);
+static void bleStart();
+static void withWifi(const char* what, void (*body)());
 static void sendBattery();
 
 static void showIdle() {
     g_view = V_IDLE;
-    // v38: 状态栏明确显示当前链路 BLE/WiFi(连接中带…)
-    const char* link = (g_mode == MODE_BLE) ? (espble::connected() ? "BLE" : "BLE…")
-                                            : (mqtt.connected() ? "WiFi" : "WiFi…");
+    // v46: 只有 BLE 一条链路了。"BLE…" = 在广播但中枢还没连上。
+    // 这个省略号是**唯一**能从屏幕上看出「中枢没连上」的地方(这块板不能读串口),
+    // 所以别把它简化掉。
+    const char* link = espble::connected() ? "BLE" : "BLE…";
     if (!g_usb) {
         // 电池模式:专门的大电量待机页(EPD 画完自动断电省电)。
         // 看板是"插电抬头看"的场景,电池模式仍以电量页为主。
@@ -87,7 +98,8 @@ static void showNotify(const String& kind, const String& src, const String& proj
 
 // 电池模式开自动轻睡眠;WiFi 模式再叠加 WiFi modem sleep。插电全速。
 static void configurePowerSave() {
-    if (g_mode == MODE_WIFI) WiFi.setSleep(g_usb ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+    // v46:不再设 WiFi.setSleep —— BLE 常驻时 WiFi 是关着的,只有 withWifi 里那几十秒
+    // 才开,那段时间要的是尽快传完(OTA 镜像 1.29MB / 截图上传),不是省电。
 #if ESP_IDF_VERSION_MAJOR >= 5
     esp_pm_config_t pm = {};
 #else
@@ -101,24 +113,21 @@ static void configurePowerSave() {
 }
 
 static void sendBattery() {
-    // v45 诊断字段 c/d/st —— 查「中枢连上了但设备不切 BLE 模式」。
-    // 这块板不能读串口(开串口就把它敲进下载模式),所以只能把设备端状态背回主机:
-    //   c  = 累计建连次数(onConnect 触发过没有;s_stats 不被 begin/end 重置,但重启会清零)
-    //   d  = 累计断连次数
-    //   st = BLE 协议栈还在不在(WiFi 模式下**本该是 0**;若为 1 说明 end() 没真把栈停住,
-    //        那设备就是在「WiFi 模式」下还挂着广播,而没人去看 connected())
-    // 查清之后这三个字段可以删掉。
-    char buf[220];
+    // c/d/st 是 v45 为排查加的,v46 起**保留**,因为在 BLE-only 下它们的含义更重要了:
+    //   c/d = 累计建连/断连次数 —— 唯一能看出链路 flapping 的地方(重启清零,用 up 关联)
+    //   st  = BLE 协议栈还在不在。**BLE-only 下 st=0 就是「设备已失联」** ——
+    //         没有 WiFi 兜底了,栈掉了就再也没人能连上它,这是最该报警的一个位。
+    // 没有 link 字段了:只有一条链路,写死一个 "ble" 没有信息量(屏幕上的 "BLE…" 才有)。
+    char buf[200];
     snprintf(buf, sizeof(buf),
-        "{\"pct\":%d,\"mv\":%d,\"up\":%lu,\"usb\":%d,\"v\":%d,\"g5\":%d,\"chg\":%d,\"ls\":%d,\"link\":\"%s\""
+        "{\"pct\":%d,\"mv\":%d,\"up\":%lu,\"usb\":%d,\"v\":%d,\"g5\":%d,\"chg\":%d,\"ls\":%d"
         ",\"c\":%lu,\"d\":%lu,\"st\":%d}",
         batteryPercent(), M5.Power.getBatteryVoltage(), (unsigned long)(millis() / 1000), g_usb ? 1 : 0,
         FW_VERSION, analogReadMilliVolts(PIN_USB_DET), (int)M5.Power.isCharging(), g_usb ? 0 : 1,
-        g_mode == MODE_BLE ? "ble" : "wifi",
         (unsigned long)espble::stats().connects, (unsigned long)espble::stats().disconnects,
         espble::started() ? 1 : 0);
-    if (g_mode == MODE_WIFI) { if (mqtt.connected()) mqtt.publish(TOPIC_DEVICE, buf, true); }
-    else espble::notify(String(buf));
+    // 未连接时 notify() 静默丢弃 —— 没关系,中枢重连后会拿到下一个周期的。
+    espble::notify(String(buf));
     Serial.printf("[bat] %s\n", buf);
 }
 
@@ -135,27 +144,7 @@ static void checkLowBatt() {
     }
 }
 
-static bool connectMqtt() {
-    mqtt.setServer(MQTT_HOST, MQTT_PORT);
-    mqtt.setBufferSize(MQTT_BUFFER_SIZE);
-    mqtt.setKeepAlive(MQTT_KEEPALIVE_SEC);
-    mqtt.setCallback(onMessage);
-    String cid = "m5papers3-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-    const char* user = strlen(MQTT_USER) ? MQTT_USER : nullptr;
-    const char* pass = strlen(MQTT_PASS) ? MQTT_PASS : nullptr;
-    // 持久会话:短暂掉线期间 broker 排队 QoS1 事件,重连补发
-    bool ok = mqtt.connect(cid.c_str(), user, pass, nullptr, 0, false, nullptr, false);
-    if (ok) {
-        mqtt.subscribe(TOPIC_EVENT, 1);
-        mqtt.subscribe(TOPIC_CMD, 1);
-        // v39 看板:QoS0 就够(retained,重连即得最新一帧,不需要补历史)
-        mqtt.subscribe(TOPIC_USAGE, 0);
-        Serial.println("[mqtt] connected + subscribed (events/cmd/usage)");
-    }
-    return ok;
-}
-
-// ---- 模式切换(射频互斥)----
+// ---- 射频:BLE 常驻,WiFi 按需借用(两者互斥)----
 
 // v40 起链路层来自 esp-ble-link。本工程只提供**自己特有**的那一项:广播名。
 // GATT UUID(NUS)、环形缓冲与帧上限、notify 分片、连接参数纪律全部用框架默认值 ——
@@ -169,38 +158,36 @@ static espble::LinkConfig bleConfig() {
     return cfg;
 }
 
-static bool tryBle(uint32_t waitMs) {
-    espble::begin(bleConfig());          // 启动 BLE 广播
-    uint32_t t0 = millis();
-    while (!espble::connected() && millis() - t0 < waitMs) delay(100);
-    return espble::connected();
-}
-static void enterBleMode() {
-    g_mode = MODE_BLE;
-    WiFi.disconnect(true); WiFi.mode(WIFI_OFF);   // 让出 2.4G
-    g_bleDropAt = 0;
+// 起 BLE 并开始广播。**不等连接** —— 以前那个「阻塞等 30s」是双模状态机的遗物
+// (要在超时后决定切不切 WiFi)。现在没有要决定的事了:一直广播,中枢什么时候来都行。
+// 不阻塞的额外好处是开机能立刻画屏,而不是先黑 30 秒。
+static void bleStart() {
+    WiFi.disconnect(true); WiFi.mode(WIFI_OFF);   // 把 2.4G 完整留给 BLE
+    if (!espble::begin(bleConfig())) Serial.println("[ble] begin 失败(内存?)");
     configurePowerSave();
-    Serial.println("[mode] -> BLE");
-}
-static void enterWifiMode() {
-    g_mode = MODE_WIFI;
-    // 释放 BT,把 2.4G 让给 WiFi。
-    // ⚠️ espble::end() 会真的 deinit 协议栈。这一行的历史值得记一下:
-    //    FW43 及之前它**每次都 panic** —— 于是「开机等 30s BLE → 超时走这里 → 崩 → 重启」
-    //    成了无限循环,而屏幕停在「蓝牙连接中…」那一帧,看着像连不上、完全不像崩溃。
-    //    根因在框架里(静态回调对象被 NimBLE 拿去 delete,见 esp-ble-link A13),
-    //    **与 core 版本无关** —— 原来这里写着「core 2.0.17 上没问题」,那句是错的,
-    //    而且因为设备确实跑在 2.0.17 上,它把排查方向带偏了整整一晚。
-    //    框架 0.1.1 已修,所以现在这行是安全的。**前提:lib_deps 拉到的版本 ≥0.1.1。**
-    //    (core 3.x 上另有一条独立的 deinit 坑,是 A9,真要升 platform 时再看。)
-    espble::end();
-    WiFi.mode(WIFI_STA);
-    wifiConnectNVS();
-    connectMqtt();
-    configurePowerSave();
-    Serial.printf("[mode] -> WiFi ip=%s\n", WiFi.localIP().toString().c_str());
+    Serial.println("[ble] advertising");
 }
 
+// 借用射频跑一件需要 WiFi 的事,干完还给 BLE。目前只有两个调用者:OTA 和屏幕 dump。
+//
+// ⚠️ 必须真的 end() 把 BLE 协议栈停掉 —— 这块板 BLE/WiFi 射频互斥,只 stopAdvertising
+//    是不够的。这一行在框架 <0.1.1 时**每次都 panic**(A13),所以 lib_deps 必须 ≥0.1.1。
+// ⚠️ body() 可能不返回:checkOTA() 拉到新镜像会直接重启。所以还原 BLE 的代码写在后面
+//    是「没升级成功」才会走到的路径 —— 这是对的,不要试图在重启前"清理"。
+static void withWifi(const char* what, void (*body)()) {
+    Serial.printf("[wifi] 借用射频:%s\n", what);
+    renderStatus((String("连 WiFi:") + what + "…").c_str());
+    espble::end();
+    WiFi.mode(WIFI_STA);
+    if (wifiConnectNVS()) {
+        body();
+    } else {
+        Serial.println("[wifi] 连不上,放弃");
+    }
+    WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+    bleStart();          // 还给 BLE —— 这一步失败设备就失联了,所以放在最后且无条件执行
+    showIdle();
+}
 void setup() {
     auto cfg = M5.config();
     cfg.clear_display = false;
@@ -218,77 +205,28 @@ void setup() {
                   M5.Power.getBatteryVoltage(), M5.Power.getBatteryLevel(), g_usb);
     buzzPattern("boot");
 
-    // BLE 优先:开机先广播等中枢连;超时→WiFi 兜底(顺带查 OTA)
-    renderStatus("蓝牙连接中…");
-    if (tryBle(BLE_BOOT_WAIT_MS)) {
-        enterBleMode();
-        Serial.printf("[boot] v%d BLE usb=%d boot#%u\n", FW_VERSION, g_usb, g_bootCount);
-    } else {
-        renderStatus("蓝牙超时,连 WiFi…");
-        enterWifiMode();
-        checkOTA();
-        Serial.printf("[boot] v%d WiFi usb=%d boot#%u\n", FW_VERSION, g_usb, g_bootCount);
-    }
+    // BLE-only:开始广播就完事,不等中枢(等不等它都一样要广播)。
+    // 注意这里**没有** checkOTA() 了 —— 以前开机走 WiFi 兜底时会顺手查一次更新,
+    // 那是唯一不依赖 BLE 的救援通道。老板明确选择去掉,现在只认 BLE 下发的 cmd=ota。
+    bleStart();
+    Serial.printf("[boot] v%d BLE-only usb=%d boot#%u\n", FW_VERSION, g_usb, g_bootCount);
     showIdle();
 }
 
 void loop() {
     uint32_t now = millis();
 
-    if (g_mode == MODE_BLE) {
-        String bmsg;
-        while (espble::popMessage(bmsg)) handleBleMessage(bmsg);
-        if (!espble::connected()) {
-            if (g_bleDropAt == 0) g_bleDropAt = now;
-            else if (now - g_bleDropAt > BLE_DROP_TIMEOUT_MS) {
-                Serial.println("[mode] BLE 掉线超时 → WiFi 兜底");
-                enterWifiMode();
-                showIdle();
-            }
-        } else {
-            g_bleDropAt = 0;   // 连接参数由中心驱动,外设这里无事可做(见 EspBleLink.h)
-        }
-    } else {   // MODE_WIFI
-        if (WiFi.status() != WL_CONNECTED) { renderStatus("重连 WiFi…"); wifiConnectNVS(); }
-        if (!mqtt.connected()) {
-            static uint32_t lastTry = 0;
-            if (now - lastTry > 3000) { lastTry = now; connectMqtt(); }
-        }
-        mqtt.loop();
-        // 定时回试 BLE(连上则切回低功耗)
-        static uint32_t lastBleRetry = 0;
-        if (lastBleRetry == 0) lastBleRetry = now;
-        if (now - lastBleRetry > BLE_RETRY_INTERVAL_MS) {
-            lastBleRetry = now;
-            Serial.println("[mode] 回试 BLE…");
-            mqtt.disconnect(); WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-            if (tryBle(BLE_RETRY_WAIT_MS)) { enterBleMode(); showIdle(); }
-            else { Serial.println("[mode] BLE 仍不可达,回 WiFi"); enterWifiMode(); }
-        }
-    }
+    String bmsg;
+    while (espble::popMessage(bmsg)) handleBleMessage(bmsg);
 
-    // OTA(需 WiFi)
-    if (g_doOta) {
-        g_doOta = false;
-        if (g_mode == MODE_BLE) {
-            Serial.println("[ota] BLE 模式收到 ota,临时切 WiFi");
-            espble::end(); WiFi.mode(WIFI_STA); wifiConnectNVS();
-            checkOTA();                          // 成功会自动重启
-            WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-            if (tryBle(BLE_RETRY_WAIT_MS)) enterBleMode(); else enterWifiMode();
-            showIdle();
-        } else {
-            checkOTA();
-        }
-    }
+    // 掉线不用做任何事:框架的 onDisconnect 会自动重新广播,中枢会自己回来。
+    // (以前这里有个 60s 计时器用来切 WiFi 兜底,v46 连同那套状态机一起删了。)
 
-    // 屏幕 dump(调试用,需 WiFi)。BLE 模式下射频互斥、WiFi 是关的,**不为它切模式** ——
-    // 切一次要断 BLE + 重连,代价远大于一次截图;调试时让设备走 WiFi 兜底即可。
-    if (g_doDump) {
-        g_doDump = false;
-        if (g_mode == MODE_BLE) Serial.println("[dump] BLE 模式下 WiFi 关闭,跳过(调试请走 WiFi 兜底)");
-        else postScreenDump();
-    }
+    // 下面两件事需要 WiFi —— 借一下射频,干完还给 BLE。
+    // v46 起 dump 也走这条路:以前它在 BLE 模式下直接跳过,理由是"切一次代价太大",
+    // 但兜底模式没了之后"让设备走 WiFi 兜底"这个前提也没了,再跳过就等于永久不可用。
+    if (g_doOta)  { g_doOta  = false; withWifi("查更新", checkOTA); }
+    if (g_doDump) { g_doDump = false; withWifi("回传屏幕", postScreenDump); }
 
     // 事件 → 通知卡(live)/ 历史(补发)
     if (g_haveEvent) {

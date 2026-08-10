@@ -3,7 +3,7 @@
 // v26 起:WiFi + MQTT 常连 + PM 自动轻睡眠(WiFi modem sleep),低功耗且通知即时;全屋覆盖不受 BLE 距离限制。
 
 // 固件版本(每次要 OTA 推新时 +1;gateway 的 /fw/version 返回值 > 此值即触发更新)
-#define FW_VERSION 45
+#define FW_VERSION 46
 
 // ---- MQTT 主题 ----
 #define TOPIC_EVENT  "m5paper/events"  // 事件:done/needs_input/quota(QoS1 离线排队)
@@ -25,13 +25,12 @@
 #define BLE_CAPS     "usage,ev,cmd"    // 随 hello 帧上报,中枢据此决定广播发不发给它
 // GATT UUID、帧上限、连接参数纪律全部归 esp-ble-link,本工程不再复述。
 // 需要非默认值时在 main.cpp 的 bleConfig() 里覆盖 LinkConfig 对应字段。
-// 双模切换时序(这部分是本工程自己的策略,框架不管)
-#define BLE_BOOT_WAIT_MS     30000     // 开机等中枢连上的时长,超时→WiFi 兜底
-#define BLE_DROP_TIMEOUT_MS  60000     // BLE 掉线持续这么久→切 WiFi 兜底
-#define BLE_RETRY_INTERVAL_MS 300000   // WiFi 兜底时,每隔这么久回试一次 BLE(5min)
-#define BLE_RETRY_WAIT_MS    15000     // 每次回试 BLE 等中枢连上的时长
+// v46:双模切换时序(BLE_BOOT_WAIT_MS / BLE_DROP_TIMEOUT_MS / BLE_RETRY_INTERVAL_MS /
+// BLE_RETRY_WAIT_MS)全部删除 —— 状态机没了,没有"等多久再切"这件事了。
+// 留个记录:那套参数(每 300s 广播 15s)正是主机连不上的病因,占空比只有 5%,
+// 和中枢的重连退避互相错过。别再把它们加回来。
 
-// ---- 省电:电池模式自动轻睡眠(保持 WiFi 连接,CPU 在空闲/DTIM 间隙睡)----
+// ---- 省电:电池模式自动轻睡眠(BLE 常驻,CPU 在空闲/广播间隙睡)----
 #define PM_MIN_FREQ_MHZ    40          // 轻睡眠时降频到此
 #define PM_MAX_FREQ_MHZ    240
 #define LOOP_IDLE_MS       250         // 主循环空闲步进(轻睡眠期);越大越省电,通知延迟越大(≤此值)
