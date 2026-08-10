@@ -47,28 +47,34 @@ tz_offset_hours = 8      # 顶栏时钟的时区偏移。Mac Mini 系统时区�
                          # 直接用 localtime 会在墨水屏上显示美西时间(时钟本身是准的)
 
 [channels]
-# 设备固件是双模的(BLE 优先 + WiFi/MQTT 兜底),所以两条渠道可以同时开:
+# FW46 起设备是 **BLE-only** 的:数据全走 BLE,WiFi 只在 OTA / 屏幕 dump 时被临时借用。
 #   ble  = true  → 经原生 Swift helper 直连设备,**完全不需要 mosquitto**
-#   mqtt = true  → 经 broker,设备落 WiFi 兜底时仍能收
-# 只想要 BLE、彻底去掉 broker:把 mqtt 设成 false。
-# ⚠️ 开 ble 前先装 espble 并编 helper(v40 起链路层来自 esp-ble-link):
-#      pip install -e ~/esp-ble-link/host
-#      espble build-helper --name M5PaperBLEHelper \
-#                          --bundle-id com.nanzhang.m5paper.blehelper
-#    首次运行需在 系统设置 > 隐私与安全性 > 蓝牙 里允许它,而且监护进程必须在
-#    GUI 会话里(SSH 里 open 出来的 helper 拿不到 bluetoothd,现象是事件流卡在
-#    central_created —— 那不是签名问题,详见 esp-ble-link 的 docs/pitfalls.md B1)。
-mqtt = true
-ble = false
+#   mqtt = true  → 已无意义(设备不再订阅 broker),除非你还有别的 MQTT 消费者
+# ⚠️ 开 ble 前先让 collector 用的那个 python 能 import espble。
+#    Mac Mini 上 collector 跑的是 /usr/bin/python3(Xcode 自带 3.9),它的 pip 太老
+#    装不了 PEP 660 editable,所以走 LaunchAgent 的 EnvironmentVariables:
+#      PYTHONPATH = /Users/nanzhang/esp-ble-link/host
+#    这样也更好 —— 跟固件 lib_deps 一样直接读 git 工作副本,不会拿到快照。
+#    (装不上 espble 时 make_channel 只会 warn 一句「BLE 渠道启动失败」然后继续,
+#     如果 mqtt 也是 false,结果是**一条渠道都没有、设备什么都收不到**。)
+# ⚠️ helper 首次授权要在 GUI 会话里点一次(SSH 里 open 出来的拿不到 bluetoothd,
+#    现象是事件流卡在 central_created —— 不是签名问题,见 esp-ble-link pitfalls B1)。
+mqtt = false
+ble = true
 
 [ble]
-device_name = "M5PaperNotify"   # 精确名匹配。桌上还有 Codex-*/Claude-* 两个 NUS 设备,
-                                # 只按 service UUID 兜底会抢到别人的 stick
+# ⚠️ **别设 device_name。** 它在 helper 的匹配里优先级高于 name_prefix,一旦写错就是
+# 「明明扫到了设备却报 timed out scanning for <你写的名字>」。这里以前默认写死
+# "M5PaperNotify",那是 FW41 之前的名字,FW41 起固件从 efuse MAC 派生广播名。
+name_prefix = "m5paper-"        # 固件 BLE_TYPE + efuse MAC 后 3 字节 → m5paper-c119cc
 helper_app = ""                 # 留空 = <repo>/.build/native/M5PaperBLEHelper.app
+                                # 现在统一用单一 bundle:~/.local/espble/EspBleHub.app
 session_dir = ""                # 留空 = ~/.config/m5paper-monitor/ble-session
 reconnect_sec = 5               # 前几次的重试间隔(掉线就丢掉整个 helper 进程重开)
-backoff_max_sec = 45            # 连续失败 5 次后放缓到这个间隔;别调太大,设备在
-                                # WiFi 兜底时每 5 分钟只回试 15s,退避过长会一直错过
+backoff_max_sec = 45            # 连续失败 5 次后放缓到这个间隔。
+                                # (FW46 之前这里有个坑:设备每 5 分钟只广播 15s,
+                                #  退避和那个窄窗口互相错过,实测 240s 一次都连不上。
+                                #  BLE-only 之后设备一直在广播,这个参数不再敏感。)
 keepalive_sec = 30              # 重发 retained 的 usage 探活(rev 不变→设备不重绘墨水屏)
 history_n = 8                   # 重连后以 live:false 补发的最近事件条数
 scan_timeout = 20               # helper 扫不到设备多久自杀,交给 Python 重开

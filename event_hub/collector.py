@@ -45,11 +45,15 @@ DEFAULTS = {
     "gwtraffic": {"host": "", "control_path": "~/.ssh/cm-gwtraffic.sock",
                   "identity": "~/.ssh/id_ed25519", "ttl_sec": 30},
     "usage": {"enabled": True, "min_republish_sec": 300, "tz_offset_hours": 8},
-    # 渠道选择。ble=true 走原生 Swift helper 直连设备,**不需要 mosquitto**;
-    # 两个都开 = BLE 主力 + 设备落 WiFi 兜底时仍能收(代价是留着 broker)。
-    # 默认先只开 mqtt,保持既有行为;helper 编好、设备上线后再把 ble 打开。
-    "channels": {"mqtt": True, "ble": False},
-    "ble": {"device_name": "M5PaperNotify", "helper_app": "", "session_dir": "",
+    # 渠道选择。ble=true 走原生 Swift helper 直连设备,**不需要 mosquitto**。
+    # FW46 起设备是 BLE-only 的(WiFi 只在 OTA/dump 时临时借用),mqtt 渠道对设备
+    # 已经没有用了,所以默认改成只开 ble。
+    "channels": {"mqtt": False, "ble": True},
+    # ⚠️ device_name 必须留空。它在 helper 的匹配里**优先级高于 name_prefix**,
+    #    而这里以前写死 "M5PaperNotify" —— 那是 FW41 之前的名字。FW41 起身份由固件
+    #    从 efuse MAC 派生成 `m5paper-<后3字节>`,于是这个陈旧默认值让 BLE 渠道一开
+    #    就报 "timed out scanning for M5PaperNotify",而设备明明在广播、就在扫描结果里。
+    "ble": {"device_name": "", "name_prefix": "m5paper-", "helper_app": "", "session_dir": "",
             "reconnect_sec": 5, "keepalive_sec": 30, "history_n": 8, "scan_timeout": 20},
 }
 
