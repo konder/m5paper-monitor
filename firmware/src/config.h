@@ -3,7 +3,7 @@
 // v26 起:WiFi + MQTT 常连 + PM 自动轻睡眠(WiFi modem sleep),低功耗且通知即时;全屋覆盖不受 BLE 距离限制。
 
 // 固件版本(每次要 OTA 推新时 +1;gateway 的 /fw/version 返回值 > 此值即触发更新)
-#define FW_VERSION 44
+#define FW_VERSION 45
 
 // ---- MQTT 主题 ----
 #define TOPIC_EVENT  "m5paper/events"  // 事件:done/needs_input/quota(QoS1 离线排队)

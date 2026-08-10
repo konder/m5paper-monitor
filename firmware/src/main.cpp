@@ -101,12 +101,22 @@ static void configurePowerSave() {
 }
 
 static void sendBattery() {
-    char buf[160];
+    // v45 诊断字段 c/d/st —— 查「中枢连上了但设备不切 BLE 模式」。
+    // 这块板不能读串口(开串口就把它敲进下载模式),所以只能把设备端状态背回主机:
+    //   c  = 累计建连次数(onConnect 触发过没有;s_stats 不被 begin/end 重置,但重启会清零)
+    //   d  = 累计断连次数
+    //   st = BLE 协议栈还在不在(WiFi 模式下**本该是 0**;若为 1 说明 end() 没真把栈停住,
+    //        那设备就是在「WiFi 模式」下还挂着广播,而没人去看 connected())
+    // 查清之后这三个字段可以删掉。
+    char buf[220];
     snprintf(buf, sizeof(buf),
-        "{\"pct\":%d,\"mv\":%d,\"up\":%lu,\"usb\":%d,\"v\":%d,\"g5\":%d,\"chg\":%d,\"ls\":%d,\"link\":\"%s\"}",
+        "{\"pct\":%d,\"mv\":%d,\"up\":%lu,\"usb\":%d,\"v\":%d,\"g5\":%d,\"chg\":%d,\"ls\":%d,\"link\":\"%s\""
+        ",\"c\":%lu,\"d\":%lu,\"st\":%d}",
         batteryPercent(), M5.Power.getBatteryVoltage(), (unsigned long)(millis() / 1000), g_usb ? 1 : 0,
         FW_VERSION, analogReadMilliVolts(PIN_USB_DET), (int)M5.Power.isCharging(), g_usb ? 0 : 1,
-        g_mode == MODE_BLE ? "ble" : "wifi");
+        g_mode == MODE_BLE ? "ble" : "wifi",
+        (unsigned long)espble::stats().connects, (unsigned long)espble::stats().disconnects,
+        espble::started() ? 1 : 0);
     if (g_mode == MODE_WIFI) { if (mqtt.connected()) mqtt.publish(TOPIC_DEVICE, buf, true); }
     else espble::notify(String(buf));
     Serial.printf("[bat] %s\n", buf);
