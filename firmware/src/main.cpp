@@ -175,10 +175,14 @@ static void enterBleMode() {
 static void enterWifiMode() {
     g_mode = MODE_WIFI;
     // 释放 BT,把 2.4G 让给 WiFi。
-    // ⚠️ espble::end() 会真的 deinit 协议栈。本工程跑在 Arduino core 2.0.17(IDF 4.4)
-    //    上没问题;**如果哪天把 platform 升到带 core 3.x 的版本,这里会 panic**
-    //    (NimBLE 1.4.x 的 HCI deinit 在 IDF 5.x 上是坏的,见 esp-ble-link
-    //     docs/pitfalls.md A9),那时要改成 espble::quiesce()。
+    // ⚠️ espble::end() 会真的 deinit 协议栈。这一行的历史值得记一下:
+    //    FW43 及之前它**每次都 panic** —— 于是「开机等 30s BLE → 超时走这里 → 崩 → 重启」
+    //    成了无限循环,而屏幕停在「蓝牙连接中…」那一帧,看着像连不上、完全不像崩溃。
+    //    根因在框架里(静态回调对象被 NimBLE 拿去 delete,见 esp-ble-link A13),
+    //    **与 core 版本无关** —— 原来这里写着「core 2.0.17 上没问题」,那句是错的,
+    //    而且因为设备确实跑在 2.0.17 上,它把排查方向带偏了整整一晚。
+    //    框架 0.1.1 已修,所以现在这行是安全的。**前提:lib_deps 拉到的版本 ≥0.1.1。**
+    //    (core 3.x 上另有一条独立的 deinit 坑,是 A9,真要升 platform 时再看。)
     espble::end();
     WiFi.mode(WIFI_STA);
     wifiConnectNVS();
