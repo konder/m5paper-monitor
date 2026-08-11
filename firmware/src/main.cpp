@@ -265,6 +265,24 @@ void setup() {
 }
 
 void loop() {
+#ifdef WDT_SELFTEST
+    // ---- 看门狗阳性自测(默认不编进去)----
+    // **故意**把主循环挂死,验证 TWDT 真的会复位芯片、且复位后 rst=6(ESP_RST_TASK_WDT)。
+    //
+    // 为什么非做不可:上一个看门狗(框架的 checkVisibility)装了却救不了自己 ——
+    // 它住在主循环里,主循环挂了它一起挂。「装上了」和「会生效」是两件事,
+    // 而这个东西平时不响,不主动测就永远不知道它是不是哑的。
+    //
+    // 用法:
+    //   PLATFORMIO_BUILD_FLAGS=-DWDT_SELFTEST python3 -m platformio run -e PaperS3 -d firmware
+    //   刷进去 → 开机 45 秒后主循环卡死 → 约 30 秒后应自动复位 →
+    //   遥测里 rst=6 即通过 → 然后刷回干净固件。
+    if (millis() > 45000) {
+        Serial.println("[wdt] 自测:开始故意挂死主循环,30s 后应被复位");
+        Serial.flush();
+        for (;;) { __asm__ __volatile__("nop"); }   // 不喂狗、不 delay
+    }
+#endif
     uint32_t now = millis();
 
     String bmsg;
