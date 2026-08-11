@@ -252,14 +252,14 @@ void setup() {
     // ⚠️ 超时要给够。墨水屏全刷 1~2 秒,加上一轮里可能连着刷屏 + 发帧,
     //    定太短会把正常操作判成挂死 —— 那比不装看门狗更糟(无限复位环)。
     //    30 秒:任何正常单轮都远够,而 18 小时失联变成 30 秒空档。
-    esp_task_wdt_config_t wcfg = {};
-    wcfg.timeout_ms     = WDT_TIMEOUT_S * 1000;
-    wcfg.idle_core_mask = 0;        // 不看 idle 任务 —— 要盯的是主循环
-    wcfg.trigger_panic  = true;     // 复位(而不是只打印),这才是救援
-    esp_err_t we = esp_task_wdt_reconfigure(&wcfg);
-    bool wok = enableLoopWDT();
-    Serial.printf("[wdt] reconfigure=%s loop=%d timeout=%ds\n",
-                  esp_err_to_name(we), (int)wok, WDT_TIMEOUT_S);
+    // ⚠️ 这里用的是 **IDF 4.x** 的老 API(本工程 framework-arduinoespressif32 是
+    //    core 2.x / IDF 4.4):esp_task_wdt_init(超时秒数, panic)。
+    //    IDF 5.x 那套 esp_task_wdt_config_t + esp_task_wdt_reconfigure() 在这里
+    //    **编译不过** —— 别照 5.x 的文档抄(我已经踩过一次)。
+    //    再调一次 init 就是重新配超时,是允许的(Arduino 启动时已经初始化过 TWDT)。
+    esp_err_t we = esp_task_wdt_init(WDT_TIMEOUT_S, true);   // panic=true → 复位
+    enableLoopWDT();                                        // 把 loopTask 挂上去
+    Serial.printf("[wdt] init=%s timeout=%ds\n", esp_err_to_name(we), WDT_TIMEOUT_S);
 
     showIdle();
 }
