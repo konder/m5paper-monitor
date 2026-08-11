@@ -3,7 +3,14 @@
 // v26 起:WiFi + MQTT 常连 + PM 自动轻睡眠(WiFi modem sleep),低功耗且通知即时;全屋覆盖不受 BLE 距离限制。
 
 // 固件版本(每次要 OTA 推新时 +1;gateway 的 /fw/version 返回值 > 此值即触发更新)
-#define FW_VERSION 48
+#define FW_VERSION 49
+
+// 硬件看门狗超时(秒)。主循环连续这么久没喂就复位。
+// ⚠️ 别定小。墨水屏全刷 1~2 秒,一轮里可能连着刷屏 + 发帧;定太短会把正常操作
+//    判成挂死,变成无限复位环 —— 那比不装看门狗更糟。
+//    30 秒的取舍:任何正常单轮都远够,而「主循环挂死」从 18 小时失联变成 30 秒空档。
+//    OTA / 屏幕 dump 那种几十秒的操作走 withWifi(),它会临时关掉看门狗。
+#define WDT_TIMEOUT_S 30
 
 // ---- MQTT 主题 ----
 #define TOPIC_EVENT  "m5paper/events"  // 事件:done/needs_input/quota(QoS1 离线排队)

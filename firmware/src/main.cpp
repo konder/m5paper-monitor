@@ -22,6 +22,8 @@
 #include <ArduinoJson.h>
 #include <esp_pm.h>
 #include <esp_wifi.h>
+#include <esp_system.h>          // esp_reset_reason:分辨「看门狗救的」和「正常开机」
+#include <esp_task_wdt.h>        // 硬件 TWDT —— 主循环挂死时唯一还能救的东西
 
 #include "secrets.h"
 #include "config.h"
@@ -127,19 +129,22 @@ static void sendBattery() {
     //   rf = rxFrames,成功组出的完整帧 —— 给 rd 当分母,不然不知道 rd 严不严重
     //   ro = rxOversize,超过 maxFrameBytes 被整条丢弃的帧
     // 判据是阳性的:rd 一直 0 就能**排除**接收侧被打爆这条线,省得继续猜。
+    // v49 加 rst = esp_reset_reason()。这是**硬件看门狗有没有救过场的唯一远程证据** ——
+    // 6 = ESP_RST_TASK_WDT,即「主循环挂死被复位」。1=上电 3=软复位 4=panic。
+    // 串口只有插着 USB 才看得到,而这个设备平时是纯 BLE 的,所以必须进遥测。
     const espble::LinkStats& st = espble::stats();
-    char buf[280];
+    char buf[300];
     snprintf(buf, sizeof(buf),
         "{\"pct\":%d,\"mv\":%d,\"up\":%lu,\"usb\":%d,\"v\":%d,\"g5\":%d,\"chg\":%d,\"ls\":%d"
         ",\"c\":%lu,\"d\":%lu,\"st\":%d,\"sd\":%lu,\"ar\":%lu"
-        ",\"rd\":%lu,\"rf\":%lu,\"ro\":%lu}",
+        ",\"rd\":%lu,\"rf\":%lu,\"ro\":%lu,\"rst\":%d}",
         batteryPercent(), M5.Power.getBatteryVoltage(), (unsigned long)(millis() / 1000), g_usb ? 1 : 0,
         FW_VERSION, analogReadMilliVolts(PIN_USB_DET), (int)M5.Power.isCharging(), g_usb ? 0 : 1,
         (unsigned long)st.connects, (unsigned long)st.disconnects,
         espble::started() ? 1 : 0,
         (unsigned long)st.staleDrops, (unsigned long)st.advRestarts,
         (unsigned long)st.rxDroppedBytes, (unsigned long)st.rxFrames,
-        (unsigned long)st.rxOversize);
+        (unsigned long)st.rxOversize, (int)esp_reset_reason());
     // 未连接时 notify() 静默丢弃 —— 没关系,中枢重连后会拿到下一个周期的。
     espble::notify(String(buf));
     Serial.printf("[bat] %s\n", buf);
@@ -190,6 +195,11 @@ static void bleStart() {
 //    是「没升级成功」才会走到的路径 —— 这是对的,不要试图在重启前"清理"。
 static void withWifi(const char* what, void (*body)()) {
     Serial.printf("[wifi] 借用射频:%s\n", what);
+    // ⚠️ 这两件事(拉 1.3MB 固件、回传整屏)本来就要几十秒到几分钟,远超 TWDT 超时。
+    //    不关掉看门狗的话它们**必然**触发复位 —— OTA 永远升不上去。
+    //    代价老实说:这段时间没有看门狗保护。可接受,因为它们都是人手动触发的
+    //    一次性操作(BLE 下发 cmd),不是常驻路径;常驻路径才是需要兜底的那个。
+    disableLoopWDT();
     renderStatus((String("连 WiFi:") + what + "…").c_str());
     espble::end();
     WiFi.mode(WIFI_STA);
@@ -199,6 +209,8 @@ static void withWifi(const char* what, void (*body)()) {
         Serial.println("[wifi] 连不上,放弃");
     }
     WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+    enableLoopWDT();     // 长耗时段结束,把兜底装回去(要在 bleStart 之前 ——
+                         // 恢复 BLE 这一步失败才是最该被看门狗接住的)
     bleStart();          // 还给 BLE —— 这一步失败设备就失联了,所以放在最后且无条件执行
     showIdle();
 }
@@ -223,7 +235,32 @@ void setup() {
     // 注意这里**没有** checkOTA() 了 —— 以前开机走 WiFi 兜底时会顺手查一次更新,
     // 那是唯一不依赖 BLE 的救援通道。老板明确选择去掉,现在只认 BLE 下发的 cmd=ota。
     bleStart();
-    Serial.printf("[boot] v%d BLE-only usb=%d boot#%u\n", FW_VERSION, g_usb, g_bootCount);
+    Serial.printf("[boot] v%d BLE-only usb=%d boot#%u rst=%d\n",
+                  FW_VERSION, g_usb, g_bootCount, (int)esp_reset_reason());
+
+    // ---- 硬件看门狗:主循环挂死的唯一救援通道 ----
+    //
+    // 为什么非要硬件的:框架的 checkVisibility() 是搭 popMessage() 的车跑的,
+    // 而 popMessage() 由**主循环**调 —— 主循环一挂,那个看门狗跟着挂,一起死。
+    // 实测代价:设备静默 18 小时(串口无输出、不广播、主机 786 次连接失败),
+    // coredump 区全 0xff(没崩)、判活探针说它在跑应用代码 —— 就是主循环卡住了。
+    // BLE-only 没有 WiFi 兜底,那次只有接 USB 拉 EN 脚才救回来。
+    //
+    // TWDT 不依赖任何软件路径:主循环超过 WDT_TIMEOUT_S 没喂它,芯片自己复位。
+    // Arduino 的 loop() 外壳每轮自动喂(enableLoopWDT 之后),所以业务代码不用管。
+    //
+    // ⚠️ 超时要给够。墨水屏全刷 1~2 秒,加上一轮里可能连着刷屏 + 发帧,
+    //    定太短会把正常操作判成挂死 —— 那比不装看门狗更糟(无限复位环)。
+    //    30 秒:任何正常单轮都远够,而 18 小时失联变成 30 秒空档。
+    esp_task_wdt_config_t wcfg = {};
+    wcfg.timeout_ms     = WDT_TIMEOUT_S * 1000;
+    wcfg.idle_core_mask = 0;        // 不看 idle 任务 —— 要盯的是主循环
+    wcfg.trigger_panic  = true;     // 复位(而不是只打印),这才是救援
+    esp_err_t we = esp_task_wdt_reconfigure(&wcfg);
+    bool wok = enableLoopWDT();
+    Serial.printf("[wdt] reconfigure=%s loop=%d timeout=%ds\n",
+                  esp_err_to_name(we), (int)wok, WDT_TIMEOUT_S);
+
     showIdle();
 }
 
