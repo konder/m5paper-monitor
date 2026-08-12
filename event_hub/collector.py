@@ -142,6 +142,46 @@ def make_channel(cfg: dict) -> MultiChannel:
     return MultiChannel(chans)
 
 
+CMD_FILE = os.path.expanduser(os.environ.get("M5_CMD_FILE", "~/.config/m5paper-monitor/cmd"))
+
+
+def drain_cmd_file(pub):
+    """手动指令入口:往 CMD_FILE 写一行(如 `ota`),collector 下一轮就下发并删掉它。
+
+    为什么需要:`cmd=ota` 是设备**唯一**的远程刷机通道(FW46 起没有 WiFi 常驻兜底),
+    而以前下发它只能跑 `python3 -m event_hub.channels.ble --ota` —— 那必须先停掉
+    collector,因为同 bundle id 的两个 worker 会互相掐死扫描(见 esp-ble-link C10)。
+    链路不稳的时候,「停服务 → 前台等一个连接窗口 → 再起服务」根本等不到:
+    实测设备可能 1.7 小时才连上一次。
+
+    现在写个文件就行:指令进框架的待发队列(RetainedChannel._pending),
+    窗口一开自动送出去,collector 不用停。
+
+    格式:一行 `cmd` 或 `cmd 目标`(目标 = 设备 id 或别名,省略则广播)。
+    """
+    try:
+        with open(CMD_FILE, encoding="utf-8") as fh:
+            raw = fh.read().strip()
+    except OSError:
+        return
+    # 先删再发:发送可能抛异常,留着文件会导致下一轮重复下发
+    try:
+        os.remove(CMD_FILE)
+    except OSError:
+        pass
+    if not raw:
+        return
+    cmd, _, target = raw.partition(" ")
+    cmd, target = cmd.strip(), target.strip()
+    if not cmd:
+        return
+    print(f"[cmd] 手动下发 {cmd!r}" + (f" → {target}" if target else "(广播)"), file=sys.stderr)
+    try:
+        pub.send_cmd(cmd, target)
+    except Exception as e:          # noqa: BLE001 —— 一条手动指令不该掀翻主循环
+        print(f"[cmd] 下发失败: {e}", file=sys.stderr)
+
+
 def make_poller(cfg: dict) -> SourcePoller:
     """按配置组装消耗看板的远程源。
 
@@ -275,6 +315,7 @@ def main():
     prev = None
     try:
         while True:
+            drain_cmd_file(pub)
             snap = build_snapshot(with_quota=with_quota)
             pub.publish_state(snap)
             for ev in diff_events(prev, snap):

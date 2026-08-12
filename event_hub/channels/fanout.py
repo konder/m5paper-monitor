@@ -36,6 +36,10 @@ class MultiChannel:
     def publish_usage(self, payload: dict):
         self._fan("publish_usage", payload)
 
+    def send_cmd(self, cmd: str, target: str = ""):
+        """下发指令(ota / dump)。只有 BLE 渠道实现它,MQTT 渠道没有 —— _fan 会跳过。"""
+        self._fan("send_cmd", cmd, target)
+
     def close(self):
         self._fan("close")
 
