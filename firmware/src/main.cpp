@@ -24,6 +24,8 @@
 #include <esp_wifi.h>
 #include <esp_system.h>          // esp_reset_reason:分辨「看门狗救的」和「正常开机」
 #include <esp_task_wdt.h>        // 硬件 TWDT —— 主循环挂死时唯一还能救的东西
+#include <soc/rtc.h>             // rtc_clk_cal:自己量那颗 136kHz 慢 RC 漂了多少
+#include <esp_private/esp_clk.h> // esp_clk_slowclk_cal_get:IDF 开机那次校准的值
 
 #include "secrets.h"
 #include "config.h"
@@ -114,6 +116,44 @@ static void configurePowerSave() {
     Serial.printf("[pm] ls=%d min=%d -> %s\n", pm.light_sleep_enable, pm.min_freq_mhz, esp_err_to_name(e));
 }
 
+// ---- 136kHz 慢 RC 的漂移测量(v51,只读,不改任何控制器配置)----
+//
+// 为什么要量它:BLE 控制器 modem sleep 期间靠这颗 RC 计时,而规范要求 ≤ ±500 ppm。
+// IDF **只在开机时校准一次**(esp_private/esp_clk.h 原话:"esp_clk_slowclk_cal_set
+// is only called in startup code"),之后温度/电压一变就失配。这是当前对 flapping
+// 最强的假设,但一直缺**直接测量** —— 之前全靠机制推理,而我在这个问题上已经错过四次。
+//
+// 判据是双向的、可推翻的:
+//   漂移一直 < 500 ppm            → 假设**被推翻**,得重新找原因
+//   漂移越界且与电压/温度相关     → 假设坐实(直接测量,不是推理)
+//
+// ⚠️ 这里量的是**周期**:周期变长 = 频率变低。符号别读反。
+// ⚠️ rtc_clk_cal 要数 1024 个慢时钟周期 ≈ 7.5 ms,期间阻塞主循环。所以节流到 5 秒
+//    一次(占空比 0.15%),而且它和协议栈可能抢校准硬件 —— 抢不到会返回 0,
+//    那种情况只计数不用值(cto 字段)。
+static uint32_t g_calBase = 0;      // 开机基准(Q13.19,µs)
+static int32_t  g_calPpm  = 0;      // 当前相对基准的周期偏移
+static int32_t  g_calMin  = 0, g_calMax = 0;
+static uint16_t g_calTo   = 0;      // 校准超时次数
+
+static void sampleRtcCal() {
+    static uint32_t last = 0;
+    uint32_t now = millis();
+    if (g_calBase && (uint32_t)(now - last) < 5000) return;
+    last = now;
+    uint32_t v = rtc_clk_cal(RTC_CAL_RTC_MUX, 1024);
+    if (v == 0) { if (g_calTo < 65535) g_calTo++; return; }
+    if (g_calBase == 0) {
+        g_calBase = v;
+        Serial.printf("[cal] 基准 = %u (Q13.19) ≈ %.3f us,IDF 开机校准值 = %u\n",
+                      v, v / 524288.0, esp_clk_slowclk_cal_get());
+        return;
+    }
+    g_calPpm = (int32_t)(((int64_t)v - (int64_t)g_calBase) * 1000000 / (int64_t)g_calBase);
+    if (g_calPpm < g_calMin) g_calMin = g_calPpm;
+    if (g_calPpm > g_calMax) g_calMax = g_calPpm;
+}
+
 static void sendBattery() {
     // c/d/st 是 v45 为排查加的,v46 起**保留**,因为在 BLE-only 下它们的含义更重要了:
     //   c/d = 累计建连/断连次数 —— 唯一能看出链路 flapping 的地方(重启清零,用 up 关联)
@@ -132,19 +172,28 @@ static void sendBattery() {
     // v49 加 rst = esp_reset_reason()。这是**硬件看门狗有没有救过场的唯一远程证据** ——
     // 6 = ESP_RST_TASK_WDT,即「主循环挂死被复位」。1=上电 3=软复位 4=panic。
     // 串口只有插着 USB 才看得到,而这个设备平时是纯 BLE 的,所以必须进遥测。
+    // v51 加的五个字段是**为了验证/推翻 flapping 的时钟假设**,不是常规遥测:
+    //   cppm = 136kHz 慢 RC 的周期相对开机基准漂了多少 ppm(BLE 预算 ±500)
+    //   cmin/cmax = 自开机以来的极值 —— 遥测每 20s 一条,峰值会漏,所以设备侧自己记
+    //   cto  = 校准超时次数(和协议栈抢硬件),非 0 说明取样有缺口
+    //   tc   = 芯片内部温度,用来看漂移和温度的相关性
+    // 三者加上已有的 mv(电池电压),就能判断漂移到底跟着谁走。
     const espble::LinkStats& st = espble::stats();
-    char buf[300];
+    char buf[380];
     snprintf(buf, sizeof(buf),
         "{\"pct\":%d,\"mv\":%d,\"up\":%lu,\"usb\":%d,\"v\":%d,\"g5\":%d,\"chg\":%d,\"ls\":%d"
         ",\"c\":%lu,\"d\":%lu,\"st\":%d,\"sd\":%lu,\"ar\":%lu"
-        ",\"rd\":%lu,\"rf\":%lu,\"ro\":%lu,\"rst\":%d}",
+        ",\"rd\":%lu,\"rf\":%lu,\"ro\":%lu,\"rst\":%d"
+        ",\"cppm\":%ld,\"cmin\":%ld,\"cmax\":%ld,\"cto\":%u,\"tc\":%d}",
         batteryPercent(), M5.Power.getBatteryVoltage(), (unsigned long)(millis() / 1000), g_usb ? 1 : 0,
         FW_VERSION, analogReadMilliVolts(PIN_USB_DET), (int)M5.Power.isCharging(), g_usb ? 0 : 1,
         (unsigned long)st.connects, (unsigned long)st.disconnects,
         espble::started() ? 1 : 0,
         (unsigned long)st.staleDrops, (unsigned long)st.advRestarts,
         (unsigned long)st.rxDroppedBytes, (unsigned long)st.rxFrames,
-        (unsigned long)st.rxOversize, (int)esp_reset_reason());
+        (unsigned long)st.rxOversize, (int)esp_reset_reason(),
+        (long)g_calPpm, (long)g_calMin, (long)g_calMax, g_calTo,
+        (int)temperatureRead());
     // 未连接时 notify() 静默丢弃 —— 没关系,中枢重连后会拿到下一个周期的。
     espble::notify(String(buf));
     Serial.printf("[bat] %s\n", buf);
@@ -284,6 +333,8 @@ void loop() {
     }
 #endif
     uint32_t now = millis();
+
+    sampleRtcCal();     // 5 秒一次,量那颗 136kHz RC 漂了多少(见 sampleRtcCal 的注释)
 
     String bmsg;
     while (espble::popMessage(bmsg)) handleBleMessage(bmsg);
