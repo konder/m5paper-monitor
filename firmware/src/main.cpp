@@ -126,8 +126,17 @@ static void configurePowerSave() {
     esp_pm_config_esp32s3_t pm = {};
 #endif
     pm.max_freq_mhz = PM_MAX_FREQ_MHZ;
-    pm.min_freq_mhz = g_usb ? PM_MAX_FREQ_MHZ : PM_MIN_FREQ_MHZ;
-    pm.light_sleep_enable = false;          // ★ 见上面第 1 条,别改回 g_usb ? ...
+    // ★ v55:电池上也**不降频**。DFS 实测把链路搞坏 60 倍(单变量对照,battmode 演练):
+    //      不降频(240MHz) → 每 ~20 分钟断一次
+    //      降到 40MHz     → 每 ~20 秒断一次
+    //   (注:DFS 曾经"挂死设备"是经由 setTxTimeoutMs(0) 那个下溢,v54 修掉之后
+    //    DFS 不再挂机 —— 但链路照样被搞坏,这是两件事。)
+    //   代价说清楚:**电池模式零省电**,续航就是全速那一档。
+    //   要拿回省电只有一条路:把 BT 的低功耗时钟换成主晶振
+    //   (CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL),Espressif 说那样 DFS 和轻睡眠都能与
+    //   BLE 共存。在那之前,能连 > 省电。
+    pm.min_freq_mhz = PM_MAX_FREQ_MHZ;
+    pm.light_sleep_enable = false;          // ★ 同理,轻睡眠也不能开(见上面第 1 条)
     g_lightSleepOn = pm.light_sleep_enable; // 遥测报真实值,不是从 g_usb 猜的
     esp_err_t e = esp_pm_configure(&pm);
     Serial.printf("[pm] ls=%d min=%d -> %s\n", pm.light_sleep_enable, pm.min_freq_mhz, esp_err_to_name(e));
