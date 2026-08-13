@@ -100,6 +100,8 @@ static void showNotify(const String& kind, const String& src, const String& proj
 
 // setEvent / applyUsage / handleBleMessage / onMessage 已移到 logic.{h,cpp}(可 native 单测)
 
+static bool g_lightSleepOn = false;     // 实际生效的轻睡眠状态(遥测 ls 字段报这个)
+
 // 电源策略。v52 起有两个改动,都是为了「电池上也能用」:
 //
 // ★ 1. **轻睡眠无条件关掉。** 实测代价太清楚了:在电池上正常开机(g_usb=false)
@@ -126,6 +128,7 @@ static void configurePowerSave() {
     pm.max_freq_mhz = PM_MAX_FREQ_MHZ;
     pm.min_freq_mhz = g_usb ? PM_MAX_FREQ_MHZ : PM_MIN_FREQ_MHZ;
     pm.light_sleep_enable = false;          // ★ 见上面第 1 条,别改回 g_usb ? ...
+    g_lightSleepOn = pm.light_sleep_enable; // 遥测报真实值,不是从 g_usb 猜的
     esp_err_t e = esp_pm_configure(&pm);
     Serial.printf("[pm] ls=%d min=%d -> %s\n", pm.light_sleep_enable, pm.min_freq_mhz, esp_err_to_name(e));
 }
@@ -247,7 +250,11 @@ static void sendBattery() {
         ",\"rd\":%lu,\"rf\":%lu,\"ro\":%lu,\"rst\":%d"
         ",\"cppm\":%ld,\"cmin\":%ld,\"cmax\":%ld,\"cto\":%u,\"tc\":%d}",
         batteryPercent(), M5.Power.getBatteryVoltage(), (unsigned long)(millis() / 1000), g_usb ? 1 : 0,
-        FW_VERSION, analogReadMilliVolts(PIN_USB_DET), (int)M5.Power.isCharging(), g_usb ? 0 : 1,
+        FW_VERSION, analogReadMilliVolts(PIN_USB_DET), (int)M5.Power.isCharging(),
+        // ⚠️ ls 以前是 `g_usb ? 0 : 1` —— 它报的是「有没有插电」,不是「轻睡眠开没开」。
+        //    v52 起轻睡眠无条件关掉之后,这个字段就在**撒谎**(电池上会报 ls:1 而实际是 0)。
+        //    改成报真实生效的值。字段名说自己是什么,就得是什么。
+        (int)g_lightSleepOn,
         (unsigned long)st.connects, (unsigned long)st.disconnects,
         espble::started() ? 1 : 0,
         (unsigned long)st.staleDrops, (unsigned long)st.advRestarts,
@@ -329,7 +336,24 @@ void setup() {
     cfg.clear_display = false;
     M5.begin(cfg);
     Serial.begin(115200);
-    Serial.setTxTimeoutMs(0);
+    // ★★★ 千万别设成 0。这一行曾经是 setTxTimeoutMs(0),意图是「别阻塞」,
+    // 而实际效果是**阻塞 49.7 天**。Arduino core 的 HWCDC::write 里:
+    //
+    //     uint32_t tries = tx_timeout_ms;   // = 0
+    //     ...
+    //     if (last_toSend == to_send) { tries--; delay(1); }   // 0-1 → 4294967295
+    //     if (tries == 0) { ...退出... }                       // 永远不成立
+    //
+    // 无符号下溢把守卫条件跳过去了,于是 Serial.printf 在「没人读 USB CDC」时
+    // 永久卡在 delay(1) 里,**把整个主循环挂死**。
+    //
+    // 实测代价:设备静默 18 小时(串口无输出 —— 因为它正卡在串口输出上),
+    // 只有拉 EN 脚硬复位能救。coredump 的 loopTask 栈是铁证:
+    //     delay → HWCDC::write → Print::printf → applyUsage(logic.cpp:60) → loop
+    // 触发条件是 CDC 停止排空 FIFO(拔线、或 APB 降频到 40MHz 后 CDC 失效)。
+    //
+    // 5 ms:一次写最多卡 5 ms 就放弃并把 connected 置 false,之后的写会快速跳过。
+    Serial.setTxTimeoutMs(5);
     g_bootCount++;
     analogReadResolution(12);
     buzzerInit();

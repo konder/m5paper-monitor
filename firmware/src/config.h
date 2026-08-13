@@ -3,7 +3,7 @@
 // v26 起:WiFi + MQTT 常连 + PM 自动轻睡眠(WiFi modem sleep),低功耗且通知即时;全屋覆盖不受 BLE 距离限制。
 
 // 固件版本(每次要 OTA 推新时 +1;gateway 的 /fw/version 返回值 > 此值即触发更新)
-#define FW_VERSION 53
+#define FW_VERSION 54
 
 // 「假装拔了 USB」演练的时长。到点自动恢复真实 USB 状态 ——
 // 这个自动恢复是安全性的关键:万一电池策略伤了 BLE 链路、指令递不进去,
