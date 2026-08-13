@@ -100,7 +100,21 @@ static void showNotify(const String& kind, const String& src, const String& proj
 
 // setEvent / applyUsage / handleBleMessage / onMessage 已移到 logic.{h,cpp}(可 native 单测)
 
-// 电池模式开自动轻睡眠;WiFi 模式再叠加 WiFi modem sleep。插电全速。
+// 电源策略。v52 起有两个改动,都是为了「电池上也能用」:
+//
+// ★ 1. **轻睡眠无条件关掉。** 实测代价太清楚了:在电池上正常开机(g_usb=false)
+//    → 轻睡眠开 → **145 次连接尝试零成功,设备实质失联**。轻睡眠会把主晶振断电,
+//    而 BLE 控制器要靠它做射频定时;醒来还要等 XTAL 起振(毫秒量级),
+//    远超一个连接事件的余量(几十微秒)。
+//    要让轻睡眠和 BLE 共存,得把 BT 的低功耗时钟换成主晶振
+//    (CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL,那样 XTAL 就不断电了)——
+//    那是构建配置的事,不在这里。**在此之前,开轻睡眠就等于把设备弄丢。**
+//
+// ★ 2. 电池上仍然降频到 PM_MIN_FREQ_MHZ(PLL 断电,这是不开轻睡眠时最大的一块省电)。
+//    ⚠️ 这一档**没验证过**:Espressif 只说「LP clock 选主晶振时 modem sleep 能在
+//    DFS 下工作」,对我们现在这个 136kHz RC 没有承诺。所以它有可能也会伤链路。
+//    自救路径是现成的 —— 见下面 refreshPowerPolicy:**插上 USB 就会实时切回全速**,
+//    不需要复位。所以这一档试坏了也能一秒恢复。
 static void configurePowerSave() {
     // v46:不再设 WiFi.setSleep —— BLE 常驻时 WiFi 是关着的,只有 withWifi 里那几十秒
     // 才开,那段时间要的是尽快传完(OTA 镜像 1.29MB / 截图上传),不是省电。
@@ -111,9 +125,27 @@ static void configurePowerSave() {
 #endif
     pm.max_freq_mhz = PM_MAX_FREQ_MHZ;
     pm.min_freq_mhz = g_usb ? PM_MAX_FREQ_MHZ : PM_MIN_FREQ_MHZ;
-    pm.light_sleep_enable = g_usb ? false : true;
+    pm.light_sleep_enable = false;          // ★ 见上面第 1 条,别改回 g_usb ? ...
     esp_err_t e = esp_pm_configure(&pm);
     Serial.printf("[pm] ls=%d min=%d -> %s\n", pm.light_sleep_enable, pm.min_freq_mhz, esp_err_to_name(e));
+}
+
+// ★ v52:运行时跟踪 USB 状态。以前 g_usb 只在 setup() 里读一次(latch),
+// 后果实测过:拔了线设备还以为插着电,整晚按插电的功耗跑电池 ——
+// 省电设计**静默失效**,而遥测里 usb 仍然是 1,只有 g5(实时 ADC)掉到 0 才露破绽。
+// 现在插拔即时生效,而且这顺带成了**自救通道**:电池上的策略要是伤了链路,
+// 插上 USB 就实时切回全速,不用复位。
+static void refreshPowerPolicy() {
+    static uint32_t last = 0;
+    uint32_t now = millis();
+    if ((uint32_t)(now - last) < 5000) return;       // 节流:ADC 不用每轮读
+    last = now;
+    bool usb = isUsbPowered();
+    if (usb == g_usb) return;
+    Serial.printf("[pm] USB %s → 重配电源策略\n", usb ? "插入" : "拔出");
+    g_usb = usb;
+    configurePowerSave();
+    g_idleDirty = true;      // 顶栏要重画(电池/插电图标变了)
 }
 
 // ---- 136kHz 慢 RC 的漂移测量(v51,只读,不改任何控制器配置)----
@@ -334,7 +366,8 @@ void loop() {
 #endif
     uint32_t now = millis();
 
-    sampleRtcCal();     // 5 秒一次,量那颗 136kHz RC 漂了多少(见 sampleRtcCal 的注释)
+    refreshPowerPolicy();   // 5 秒一次,跟踪 USB 插拔(以前只在开机读一次,latch 成了 bug)
+    sampleRtcCal();         // 5 秒一次,量那颗 136kHz RC 漂了多少(见 sampleRtcCal 的注释)
 
     String bmsg;
     while (espble::popMessage(bmsg)) handleBleMessage(bmsg);
