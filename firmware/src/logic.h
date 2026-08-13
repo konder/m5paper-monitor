@@ -28,6 +28,7 @@ extern long          g_evTs;
 
 extern volatile bool g_doOta;
 extern volatile bool g_doDump;
+extern volatile bool g_doBattTest;
 
 // ---- 纯逻辑 ----
 

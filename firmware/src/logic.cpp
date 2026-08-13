@@ -16,6 +16,7 @@ long          g_evTs = 0;
 
 volatile bool g_doOta = false;
 volatile bool g_doDump = false;   // 调试:回传当前屏幕给网关(见 ota.cpp postScreenDump)
+volatile bool g_doBattTest = false;  // 调试:假装拔掉 USB 跑一段电池策略,会自动恢复
 
 // ---- 纯逻辑 ----
 
@@ -86,6 +87,10 @@ void handleBleMessage(const String& s) {
         String cmd((const char*)(doc["cmd"] | ""));
         if (cmd.indexOf("ota") >= 0) g_doOta = true;
         if (cmd.indexOf("dump") >= 0) g_doDump = true;
+        // 调试:假装 USB 被拔掉,按电池策略跑一段再自动恢复(见 main.cpp
+        // refreshPowerPolicy)。用来在 **USB 仍插着** 的安全条件下验证电池策略
+        // 会不会伤 BLE 链路 —— 不用真拔线,也不可能把设备弄丢。
+        if (cmd.indexOf("battmode") >= 0) g_doBattTest = true;
         return;
     }
     if (!strcmp(t, "usage")) { applyUsage(doc); return; }

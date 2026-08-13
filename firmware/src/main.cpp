@@ -135,11 +135,40 @@ static void configurePowerSave() {
 // 省电设计**静默失效**,而遥测里 usb 仍然是 1,只有 g5(实时 ADC)掉到 0 才露破绽。
 // 现在插拔即时生效,而且这顺带成了**自救通道**:电池上的策略要是伤了链路,
 // 插上 USB 就实时切回全速,不用复位。
+static uint32_t g_battTestUntil = 0;    // 非 0 = 正在「假装拔了 USB」的演练里
+
 static void refreshPowerPolicy() {
     static uint32_t last = 0;
     uint32_t now = millis();
+
+    // ---- 演练:假装 USB 被拔掉(cmd=battmode 触发)----
+    // 目的:在 **USB 仍插着** 的安全条件下验证电池策略会不会伤 BLE 链路。
+    // 唯一的未知是「降频到 40MHz(PLL 断电)会不会打断链路」—— Espressif 只承诺
+    // LP clock 选主晶振时 modem sleep 能在 DFS 下工作,对现在这颗 136kHz RC 没承诺。
+    // ★ 到点自动恢复(BATT_TEST_MS)。这个自动恢复是安全性的关键:
+    //   万一链路真的断了、指令递不进去,设备也会自己回到能连的状态。
+    if (g_doBattTest) {
+        g_doBattTest = false;
+        g_battTestUntil = now + BATT_TEST_MS;
+        if (g_battTestUntil == 0) g_battTestUntil = 1;      // millis 回绕的边界
+        Serial.printf("[pm] 演练开始:假装拔掉 USB,%lu 分钟后自动恢复\n",
+                      BATT_TEST_MS / 60000UL);
+        g_usb = false;
+        configurePowerSave();
+        g_idleDirty = true;
+        last = now;
+        return;
+    }
+
     if ((uint32_t)(now - last) < 5000) return;       // 节流:ADC 不用每轮读
     last = now;
+
+    if (g_battTestUntil) {
+        if ((int32_t)(now - g_battTestUntil) < 0) return;    // 演练中,别被真实状态覆盖
+        g_battTestUntil = 0;
+        Serial.println("[pm] 演练结束,恢复真实 USB 状态");
+    }
+
     bool usb = isUsbPowered();
     if (usb == g_usb) return;
     Serial.printf("[pm] USB %s → 重配电源策略\n", usb ? "插入" : "拔出");
